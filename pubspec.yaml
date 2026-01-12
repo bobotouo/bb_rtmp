@@ -1,0 +1,26 @@
+name: bb_rtmp
+description: 高性能 Flutter RTMP 推流插件，支持硬件编码、零拷贝、自适应码率
+version: 0.1.0
+homepage: https://github.com/yourusername/bb_rtmp
+
+environment:
+  sdk: '>=2.17.0 <4.0.0'
+  flutter: ">=2.5.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  plugin_platform_interface: ^2.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.bb.rtmp
+        pluginClass: BbRtmpPlugin
+

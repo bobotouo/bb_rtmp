@@ -1,0 +1,37 @@
+[
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/rtmp.dir/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/rtmp.c.o -c /Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/rtmp.c",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/rtmp.c"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/rtmp.dir/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/log.c.o -c /Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/log.c",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/log.c"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/rtmp.dir/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/amf.c.o -c /Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/amf.c",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/amf.c"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/rtmp.dir/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/parseurl.c.o -c /Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/parseurl.c",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/parseurl.c"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/rtmp.dir/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/hashswf.c.o -c /Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/hashswf.c",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/rtmpdump/librtmp/hashswf.c"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++ --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -Dbb_rtmp_EXPORTS -I/Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++11 -frtti -fexceptions -fno-limit-debug-info  -fPIC -std=gnu++11 -o CMakeFiles/bb_rtmp.dir/src/main/cpp/rtmp_jni.cpp.o -c /Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp/rtmp_jni.cpp",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp/rtmp_jni.cpp"
+},
+{
+  "directory": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+  "command": "/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang++ --target=aarch64-none-linux-android21 --sysroot=/Users/bobo/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -DNO_CRYPTO -DRTMPDUMP_VERSION=\\\"v2.6\\\" -Dbb_rtmp_EXPORTS -I/Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp -I/Users/bobo/Desktop/project/bb_rtmp/android/../rtmpdump/librtmp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++11 -frtti -fexceptions -fno-limit-debug-info  -fPIC -std=gnu++11 -o CMakeFiles/bb_rtmp.dir/src/main/cpp/rtmp_wrapper.cpp.o -c /Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp/rtmp_wrapper.cpp",
+  "file": "/Users/bobo/Desktop/project/bb_rtmp/android/src/main/cpp/rtmp_wrapper.cpp"
+}
+]

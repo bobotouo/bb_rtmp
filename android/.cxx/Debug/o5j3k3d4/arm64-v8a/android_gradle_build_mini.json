@@ -1,0 +1,33 @@
+{
+  "buildFiles": [
+    "/Users/bobo/Desktop/project/bb_rtmp/android/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/Users/bobo/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/Users/bobo/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "rtmp::@6890427a1f51a3e7e1df": {
+      "artifactName": "rtmp",
+      "abi": "arm64-v8a",
+      "output": "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a/librtmp.a",
+      "runtimeFiles": []
+    },
+    "bb_rtmp::@6890427a1f51a3e7e1df": {
+      "artifactName": "bb_rtmp",
+      "abi": "arm64-v8a",
+      "output": "/Users/bobo/Desktop/project/bb_rtmp/example/build/bb_rtmp/intermediates/cxx/Debug/o5j3k3d4/obj/arm64-v8a/libbb_rtmp.so",
+      "runtimeFiles": []
+    }
+  }
+}

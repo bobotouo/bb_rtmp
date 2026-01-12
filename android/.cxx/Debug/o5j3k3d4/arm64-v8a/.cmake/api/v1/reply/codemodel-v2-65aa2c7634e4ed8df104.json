@@ -1,0 +1,69 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.6.0"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "bb_rtmp",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "bb_rtmp::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-bb_rtmp-Debug-8b61f1e84c07ebdab795.json",
+					"name" : "bb_rtmp",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "rtmp::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-rtmp-Debug-28bff4f94c2f1d8f4580.json",
+					"name" : "rtmp",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/Users/bobo/Desktop/project/bb_rtmp/android/.cxx/Debug/o5j3k3d4/arm64-v8a",
+		"source" : "/Users/bobo/Desktop/project/bb_rtmp/android"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}
