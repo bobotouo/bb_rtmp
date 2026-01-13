@@ -50,7 +50,7 @@ class _MyAppState extends State<MyApp> {
       _statusMessage = '正在请求权限...';
     });
 
-    // 请求摄像头权限
+    // Request camera permission
     var cameraStatus = await Permission.camera.request();
     if (cameraStatus.isDenied) {
       _showMessage('需要摄像头权限才能使用此功能');
@@ -60,7 +60,7 @@ class _MyAppState extends State<MyApp> {
       return false;
     }
 
-    // 请求麦克风权限
+    // Request microphone permission on mobile
     var microphoneStatus = await Permission.microphone.request();
     if (microphoneStatus.isDenied) {
       _showMessage('需要麦克风权限才能使用此功能');
@@ -79,6 +79,8 @@ class _MyAppState extends State<MyApp> {
 
     return false;
   }
+
+  /// Check if running on mobile platform
 
   Future<void> _initialize() async {
     if (_isInitialized) {
@@ -121,7 +123,7 @@ class _MyAppState extends State<MyApp> {
         initialCameraFacing: _initialCameraFacing,
       );
 
-      if (textureId != null) {
+      if (textureId != null && textureId >= 0) {
         setState(() {
           _textureId = textureId;
           _isInitialized = true;

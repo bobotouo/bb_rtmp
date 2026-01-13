@@ -1,0 +1,28 @@
+PODS:
+  - bb_rtmp (0.1.0):
+    - Flutter
+  - Flutter (1.0.0)
+  - permission_handler_apple (9.3.0):
+    - Flutter
+
+DEPENDENCIES:
+  - bb_rtmp (from `.symlinks/plugins/bb_rtmp/ios`)
+  - Flutter (from `Flutter`)
+  - permission_handler_apple (from `.symlinks/plugins/permission_handler_apple/ios`)
+
+EXTERNAL SOURCES:
+  bb_rtmp:
+    :path: ".symlinks/plugins/bb_rtmp/ios"
+  Flutter:
+    :path: Flutter
+  permission_handler_apple:
+    :path: ".symlinks/plugins/permission_handler_apple/ios"
+
+SPEC CHECKSUMS:
+  bb_rtmp: 0e9bc98e116b9340c444bf193d728c4126966672
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  permission_handler_apple: 4ed2196e43d0651e8ff7ca3483a069d469701f2d
+
+PODFILE CHECKSUM: c4e6b4874881de2192cd85dcd3885d0bed577cb4
+
+COCOAPODS: 1.16.2

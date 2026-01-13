@@ -4,7 +4,7 @@ version: 0.1.0
 homepage: https://github.com/yourusername/bb_rtmp
 
 environment:
-  sdk: '>=2.17.0 <4.0.0'
+  sdk: ">=2.17.0 <4.0.0"
   flutter: ">=2.5.0"
 
 dependencies:
@@ -23,4 +23,5 @@ flutter:
       android:
         package: com.bb.rtmp
         pluginClass: BbRtmpPlugin
-
+      ios:
+        pluginClass: BbRtmpPlugin
