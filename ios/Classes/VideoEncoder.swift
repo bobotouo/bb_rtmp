@@ -113,9 +113,26 @@ class VideoEncoder {
             infoFlagsOut: &flags
         )
         
-        if status != noErr {
+        if status == -12903 {
+            print("[\(tag)] Encoder not available (background?), attempting to reset session...")
+            resetSession()
+        } else if status != noErr {
             print("[\(tag)] Failed to encode frame: \(status)")
         }
+    }
+    
+    private func resetSession() {
+        guard isEncoding else { return }
+        print("[\(tag)] Resetting VTCompressionSession...")
+        
+        // Invalidate old session
+        if let session = compressionSession {
+            VTCompressionSessionInvalidate(session)
+            compressionSession = nil
+        }
+        
+        // Re-initialize with saved properties
+        _ = initialize(width: Int(width), height: Int(height), bitrate: bitrate, fps: fps)
     }
     
     /**

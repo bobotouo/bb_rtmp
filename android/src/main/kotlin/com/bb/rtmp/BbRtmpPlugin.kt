@@ -17,11 +17,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
-class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
+class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engine.plugins.activity.ActivityAware {
     private lateinit var channel: MethodChannel
     private var textureRegistry: TextureRegistry? = null
     private var context: Context? = null
+    private var activity: android.app.Activity? = null
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var isInBackground = false
 
     private var cameraController: CameraController? = null
     private var videoEncoder: VideoEncoder? = null
@@ -331,6 +333,17 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
         try {
             rtmpStreamer?.start()
             bitrateController?.start()
+            
+            // Start Foreground Service for background stability
+            context?.let { ctx ->
+                val intent = android.content.Intent(ctx, RtmpService::class.java)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(intent)
+                } else {
+                    ctx.startService(intent)
+                }
+            }
+            
             result.success(null)
         } catch (e: Exception) {
             result.error("START_STREAMING_ERROR", "开始推流失败: ${e.message}", null)
@@ -341,6 +354,13 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
         try {
             rtmpStreamer?.stop()
             bitrateController?.stop()
+            
+            // Stop Foreground Service
+            context?.let { ctx ->
+                val intent = android.content.Intent(ctx, RtmpService::class.java)
+                ctx.stopService(intent)
+            }
+            
             result.success(null)
         } catch (e: Exception) {
             result.error("STOP_STREAMING_ERROR", "停止推流失败: ${e.message}", null)
@@ -416,6 +436,96 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
         // GlRenderer 和纹理的释放由渲染循环完成
         android.util.Log.d("BbRtmpPlugin", "FBO 渲染循环停止标志已设置")
     }
+
+    private val lifecycleCallbacks = object : android.app.Application.ActivityLifecycleCallbacks {
+        override fun onActivityPaused(activity: android.app.Activity) {
+        }
+
+        override fun onActivityResumed(activity: android.app.Activity) {
+        }
+
+        override fun onActivityStarted(activity: android.app.Activity) {
+            if (activity == this@BbRtmpPlugin.activity) {
+                android.util.Log.d("BbRtmpPlugin", "App entering foreground (Activity Started) - Re-triggering video pipeline")
+                isInBackground = false
+                rtmpStreamer?.stopHeartbeat()
+                
+                // Video Resume Fix: Re-trigger camera session and request keyframe
+                if (rtmpStreamer?.isStreaming() == true) {
+                    val controller = cameraController
+                    if (controller != null) {
+                        scope.launch(Dispatchers.Main) {
+                            if (!controller.isCameraDeviceOpen()) {
+                                android.util.Log.w("BbRtmpPlugin", "Camera device was closed by OS, performing full re-open")
+                                
+                                // Stop old loop and clean up references to ensure a fresh start
+                                stopFboRenderLoop()
+                                glRenderer = null
+                                
+                                // Re-create the input texture (CameraController will attach it to GL context later)
+                                fboInputSurfaceTexture = SurfaceTexture(false)
+                                fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
+                                
+                                // Full re-open flow
+                                val success = controller.openCamera(glCameraWidth, glCameraHeight, fboInputSurfaceTexture!!)
+                                if (success) {
+                                    android.util.Log.d("BbRtmpPlugin", "Camera re-opened successfully on resume")
+                                }
+                            } else {
+                                android.util.Log.d("BbRtmpPlugin", "Requesting keyframe and re-creating camera capture session for resume")
+                                videoEncoder?.requestKeyFrame()
+                                try {
+                                    controller.createCaptureSession(emptyList<android.view.Surface>())
+                                    android.util.Log.d("BbRtmpPlugin", "Camera capture session re-triggered successfully")
+                                } catch (e: Exception) {
+                                    android.util.Log.e("BbRtmpPlugin", "Failed to re-trigger camera capture session", e)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun onActivityStopped(activity: android.app.Activity) {
+            if (activity == this@BbRtmpPlugin.activity) {
+                android.util.Log.d("BbRtmpPlugin", "App entering background (Activity Stopped)")
+                isInBackground = true
+                if (rtmpStreamer?.isStreaming() == true) {
+                    rtmpStreamer?.startHeartbeat()
+                }
+            }
+        }
+
+        override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
+        override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
+        override fun onActivityDestroyed(activity: android.app.Activity) {}
+    }
+
+    override fun onAttachedToActivity(binding: io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding) {
+        this.activity = binding.activity
+        activity?.application?.registerActivityLifecycleCallbacks(lifecycleCallbacks)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity?.application?.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
+        this.activity = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding) {
+        this.activity = binding.activity
+        activity?.application?.registerActivityLifecycleCallbacks(lifecycleCallbacks)
+    }
+
+    override fun onDetachedFromActivity() {
+        activity?.application?.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
+        this.activity = null
+    }
+
+    // Since we don't have a direct "appDidEnterBackground" in ActivityAware, 
+    // we can use the result of getStatus or other methods to check if we are minimized
+    // OR ideally, we can use the Lifecycle library if available.
+    // For now, let's add a manual check or use the Activity's lifecycle.
 
     private suspend fun changeResolution(call: MethodCall, result: Result) {
         try {
@@ -736,6 +846,15 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
                         continue
                     }
                     
+                    // 1. Skip GPU work if in background to save power and avoid potential EGL errors
+                    if (isInBackground) {
+                        frameCount++
+                        // Controlled sleep to avoid busy loop in background
+                        val targetFrameTime = 1000L / 30
+                        Thread.sleep(targetFrameTime)
+                        continue
+                    }
+                    
                     // 获取帧时间戳（纳秒）- 必须在 updateTexImage() 之后立即获取
                     // 这对于 MediaCodec 很重要，如果时间戳为 0 或倒退，编码器可能无法正确处理帧
                     val timestampNs = inputSurfaceTexture.timestamp
@@ -945,6 +1064,7 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
             // 释放 GlRenderer（在 EGL 上下文中）
             try {
                 glRenderer?.release()
+                glRenderer = null
                 android.util.Log.d("BbRtmpPlugin", "GlRenderer 已释放")
             } catch (e: Exception) {
                 android.util.Log.w("BbRtmpPlugin", "释放 GlRenderer 失败", e)
@@ -958,6 +1078,12 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler {
         try {
             // 停止 FBO 渲染循环
             stopFboRenderLoop()
+            
+            // Stop Foreground Service
+            context?.let { ctx ->
+                val intent = android.content.Intent(ctx, RtmpService::class.java)
+                ctx.stopService(intent)
+            }
             
             bitrateController?.release()
             rtmpStreamer?.release()

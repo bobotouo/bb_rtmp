@@ -12,6 +12,7 @@ class AudioEncoder {
     private var pcmBuffer = [Float]()
     private var isEncoding = false
     private var callback: EncoderCallback?
+    private var audioLogCount = 0
     
     protocol EncoderCallback {
         func onEncodedData(data: Data, info: BufferInfo)
@@ -32,6 +33,15 @@ class AudioEncoder {
      * Initialize audio encoder
      */
     func initialize() -> Bool {
+        // Configure AVAudioSession for background recording
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            try audioSession.setActive(true)
+        } catch {
+            print("[\(tag)] Failed to configure AVAudioSession: \(error)")
+        }
+
         // Setup audio engine for recording
         let engine = AVAudioEngine()
         self.audioEngine = engine
@@ -112,6 +122,11 @@ class AudioEncoder {
      */
     private func encodeAudioBuffer(buffer: AVAudioPCMBuffer, time: AVAudioTime) {
         guard let converter = audioConverter, isEncoding else { return }
+        
+        audioLogCount += 1
+        if audioLogCount % 100 == 0 {
+            print("[\(tag)] Processing audio buffer: frames=\(buffer.frameLength), sampleTime=\(time.sampleTime)")
+        }
         
         // 1. Downmix to Mono and accumulate into pcmBuffer
         let frameCount = buffer.frameLength

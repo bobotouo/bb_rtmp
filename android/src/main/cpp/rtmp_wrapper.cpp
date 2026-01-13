@@ -28,6 +28,7 @@ struct Connection {
     int height = 0;
     int video_bitrate = 0;
     int fps = 30;
+    char *url_copy = nullptr;
 };
 
 static std::map<long, Connection> g_connections;
@@ -39,6 +40,10 @@ static void free_connection(Connection &conn) {
         RTMP_Close(conn.rtmp);
         RTMP_Free(conn.rtmp);
         conn.rtmp = nullptr;
+    }
+    if (conn.url_copy) {
+        free(conn.url_copy);
+        conn.url_copy = nullptr;
     }
     conn.connected = false;
 }
@@ -487,9 +492,11 @@ rtmp_handle_t rtmp_init(const char *url) {
     RTMP_SetBufferMS(rtmp, 3600 * 1000);
     rtmp->Link.timeout = 10; // 10 秒超时
     
+    char *url_copy = strdup(url);
     LOGD("调用 RTMP_SetupURL");
-    if (!RTMP_SetupURL(rtmp, (char *) url)) {
+    if (!RTMP_SetupURL(rtmp, url_copy)) {
         LOGE("RTMP_SetupURL 失败，URL 可能格式错误: %s", url);
+        free(url_copy);
         RTMP_Free(rtmp);
         return 0;
     }
@@ -530,6 +537,7 @@ rtmp_handle_t rtmp_init(const char *url) {
     Connection conn;
     conn.rtmp = rtmp;
     conn.connected = true;
+    conn.url_copy = url_copy;
     g_connections[handle] = conn;
 
     LOGD("RTMP 初始化成功 handle=%ld (AMF0 支持已启用)", handle);
@@ -600,6 +608,11 @@ int rtmp_send_audio(rtmp_handle_t handle, unsigned char *data, int size, long ti
 
     if (!conn.sent_audio_config) {
         send_aac_sequence_header(conn);
+    }
+    
+    // 如果没有发送元数据（例如在视频开启前就开始推音频），在这里尝试发送
+    if (!conn.sent_metadata && conn.width > 0 && conn.height > 0) {
+        send_on_metadata(conn);
     }
     bool ok = send_aac_frame(conn, data, size, (uint32_t) timestamp);
     return ok ? 0 : -1;

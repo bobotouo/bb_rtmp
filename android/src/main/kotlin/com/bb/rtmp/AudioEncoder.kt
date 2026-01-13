@@ -19,6 +19,7 @@ class AudioEncoder {
     private val isEncoding = AtomicBoolean(false)
     private var encoderCallback: EncoderCallback? = null
     private var recordThread: Thread? = null
+    private var audioLogCount = 0
 
     interface EncoderCallback {
         fun onEncodedData(data: ByteBuffer, info: MediaCodec.BufferInfo)
@@ -107,6 +108,10 @@ class AudioEncoder {
                     if (inputBuffer != null) {
                         val readSize = recorder.read(inputBuffer, inputBuffer.remaining())
                         if (readSize > 0) {
+                            audioLogCount++
+                            if (audioLogCount % 100 == 0) {
+                                Log.d(TAG, "Audio data captured: $readSize bytes (total intervals=$audioLogCount)")
+                            }
                             codec.queueInputBuffer(
                                 inputBufferId,
                                 0,

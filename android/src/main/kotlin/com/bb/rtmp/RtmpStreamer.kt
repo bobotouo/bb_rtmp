@@ -13,6 +13,7 @@ class RtmpStreamer {
     private var rtmpUrl: String = ""
     private val isStreaming = AtomicBoolean(false)
     private val startTime = AtomicLong(0)
+    private var isRefreshing = false
     
     // 静态计数器用于日志（避免日志过多）
     private var staticVideoFrameCount = 0
@@ -20,6 +21,12 @@ class RtmpStreamer {
     private var audioEncoder: AudioEncoder? = null
     private var savedSps: ByteArray? = null
     private var savedPps: ByteArray? = null
+    
+    // Heartbeat for background streaming (Deep copy for thread safety)
+    private var lastVideoDataBytes: ByteArray? = null
+    private var lastVideoInfo: MediaCodec.BufferInfo? = null
+    private val heartbeatLock = Any()
+    private var heartbeatTimer: java.util.Timer? = null
 
     /**
      * 初始化 RTMP 推流器
@@ -87,22 +94,6 @@ class RtmpStreamer {
         }
     }
 
-    /**
-     * 设置元数据信息（用于 AMF0 onMetaData）
-     */
-    fun setMetadata(width: Int, height: Int, videoBitrate: Int, fps: Int, audioSampleRate: Int, audioChannels: Int) {
-        if (rtmpHandle != 0L) {
-            try {
-                RtmpNative.setMetadata(rtmpHandle, width, height, videoBitrate, fps, audioSampleRate, audioChannels)
-                val direction = if (width < height) "竖屏" else if (width > height) "横屏" else "正方形"
-                Log.d(TAG, "设置元数据: ${width}x${height} ($direction), bitrate=$videoBitrate, fps=$fps")
-            } catch (e: Exception) {
-                Log.e(TAG, "设置元数据失败", e)
-            }
-        } else {
-            Log.w(TAG, "RTMP 未初始化，无法设置元数据")
-        }
-    }
 
     /**
      * 开始推流
@@ -113,7 +104,7 @@ class RtmpStreamer {
             return
         }
 
-        startTime.set(System.currentTimeMillis() * 1000) // 微秒
+        startTime.set(System.currentTimeMillis()) // milliseconds
         isStreaming.set(true)
         Log.d(TAG, "开始推流")
         
@@ -156,7 +147,7 @@ class RtmpStreamer {
         spsPpsData[idx++] = 0x01
         System.arraycopy(pps, 0, spsPpsData, idx, pps.size)
         
-        val result = RtmpNative.sendVideo(rtmpHandle, spsPpsData, spsPpsData.size, 0, true)
+        val result = RtmpNative.sendVideo(rtmpHandle, spsPpsData, spsPpsData.size, 0L, true)
         if (result != 0) {
             Log.w(TAG, "发送 SPS/PPS 失败: $result")
         } else {
@@ -173,7 +164,127 @@ class RtmpStreamer {
         }
 
         isStreaming.set(false)
+        stopHeartbeat()
         Log.d(TAG, "停止推流")
+    }
+
+    private fun handleSocketError(error: Int) {
+        // -1 usually indicates a socket error from our C++ wrapper
+        if (error != 0 && !isRefreshing && isStreaming.get()) {
+            Log.e(TAG, "Critical socket error detected ($error). Triggering refresh...")
+            refreshConnection()
+        }
+    }
+
+    fun refreshConnection() {
+        if (!isStreaming.get() || isRefreshing) return
+        isRefreshing = true
+        
+        Log.d(TAG, "Refreshing RTMP connection...")
+        
+        Thread {
+            try {
+                // 1. Close old connection
+                if (rtmpHandle != 0L) {
+                    RtmpNative.close(rtmpHandle)
+                    rtmpHandle = 0
+                }
+                
+                // 2. Wait for server cleanup
+                Thread.sleep(1500)
+                
+                // 3. Re-init
+                rtmpHandle = RtmpNative.init(rtmpUrl)
+                if (rtmpHandle != 0L) {
+                    applyCachedMetadata()
+                    sendSpsPps()
+                    
+                    Log.d(TAG, "RTMP connection refreshed successfully")
+                    // Force a keyframe
+                    videoEncoder?.requestKeyFrame()
+                } else {
+                    Log.e(TAG, "Failed to refresh RTMP connection")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during RTMP refresh", e)
+            } finally {
+                isRefreshing = false
+            }
+        }.start()
+    }
+
+    private var cachedWidth = 0
+    private var cachedHeight = 0
+    private var cachedVideoBitrate = 0
+    private var cachedFps = 30
+    private var cachedAudioSampleRate = 44100
+    private var cachedAudioChannels = 1
+
+    /**
+     * 设置元数据信息（用于 AMF0 onMetaData）
+     */
+    fun setMetadata(width: Int, height: Int, videoBitrate: Int, fps: Int, audioSampleRate: Int, audioChannels: Int) {
+        cachedWidth = width
+        cachedHeight = height
+        cachedVideoBitrate = videoBitrate
+        cachedFps = fps
+        cachedAudioSampleRate = audioSampleRate
+        cachedAudioChannels = audioChannels
+        
+        applyCachedMetadata()
+    }
+
+    private fun applyCachedMetadata() {
+        if (rtmpHandle != 0L) {
+            try {
+                RtmpNative.setMetadata(rtmpHandle, cachedWidth, cachedHeight, cachedVideoBitrate, cachedFps, cachedAudioSampleRate, cachedAudioChannels)
+                val direction = if (cachedWidth < cachedHeight) "竖屏" else if (cachedWidth > cachedHeight) "横屏" else "正方形"
+                Log.d(TAG, "已应用元数据: ${cachedWidth}x${cachedHeight} ($direction), bitrate=$cachedVideoBitrate, fps=$cachedFps")
+            } catch (e: Exception) {
+                Log.e(TAG, "应用元数据失败", e)
+            }
+        }
+    }
+
+    private fun getStreamTimestamp(): Long {
+        return System.currentTimeMillis() - startTime.get()
+    }
+
+    fun startHeartbeat() {
+        if (!isStreaming.get() || heartbeatTimer != null) return
+        Log.d(TAG, "Starting background video heartbeat")
+        heartbeatTimer = java.util.Timer()
+        heartbeatTimer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                sendHeartbeatFrame()
+            }
+        }, 1000, 1000) // Every 1 second
+    }
+
+    fun stopHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = null
+        Log.d(TAG, "Stopped background video heartbeat")
+    }
+
+    private fun sendHeartbeatFrame() {
+        val bytes = synchronized(heartbeatLock) { lastVideoDataBytes } ?: return
+        val info = synchronized(heartbeatLock) { lastVideoInfo } ?: return
+        
+        Log.d(TAG, "Sending heartbeat video frame (Deep Copy)...")
+        val buffer = ByteBuffer.allocateDirect(bytes.size)
+        buffer.put(bytes)
+        buffer.flip()
+        
+        val timestamp = getStreamTimestamp()
+        val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+        
+        // Use the array-based send to be safe during heartbeat
+        val result = RtmpNative.sendVideo(rtmpHandle, bytes, bytes.size, timestamp, isKeyFrame)
+        if (result != 0) {
+            Log.w(TAG, "Heartbeat 发送失败: $result")
+            handleSocketError(result)
+        }
     }
 
     /**
@@ -191,7 +302,20 @@ class RtmpStreamer {
         }
 
         try {
-            val timestamp = (System.currentTimeMillis() * 1000 - startTime.get()) / 1000 // 转换为微秒
+            // Cache for heartbeat (Deep Copy to avoid buffer reuse issues)
+            synchronized(heartbeatLock) {
+                val bytes = ByteArray(info.size)
+                data.position(info.offset)
+                data.get(bytes)
+                data.position(info.offset) // Restore position
+                
+                lastVideoDataBytes = bytes
+                val infoCopy = MediaCodec.BufferInfo()
+                infoCopy.set(0, info.size, info.presentationTimeUs, info.flags)
+                lastVideoInfo = infoCopy
+            }
+
+            val timestamp = getStreamTimestamp()
             val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
             
             // 每 30 帧打印一次日志（用于调试）
@@ -214,6 +338,7 @@ class RtmpStreamer {
                     )
                     if (result != 0) {
                         Log.w(TAG, "发送视频数据失败: $result")
+                        handleSocketError(result)
                     }
                 } else {
                     // 回退到数组方式
@@ -240,6 +365,7 @@ class RtmpStreamer {
         val result = RtmpNative.sendVideo(rtmpHandle, array, info.size, timestamp, isKeyFrame)
         if (result != 0) {
             Log.w(TAG, "发送视频数据失败: $result")
+            handleSocketError(result)
         }
     }
 
@@ -252,7 +378,7 @@ class RtmpStreamer {
         }
 
         try {
-            val timestamp = (System.currentTimeMillis() * 1000 - startTime.get()) / 1000 // 转换为微秒
+            val timestamp = getStreamTimestamp()
 
             // 零拷贝：直接传递 ByteBuffer 地址
             if (data.isDirect) {
@@ -267,6 +393,7 @@ class RtmpStreamer {
                     )
                     if (result != 0) {
                         Log.w(TAG, "发送音频数据失败: $result")
+                        handleSocketError(result)
                     }
                 } else {
                     // 回退到数组方式
@@ -293,6 +420,7 @@ class RtmpStreamer {
         val result = RtmpNative.sendAudio(rtmpHandle, array, info.size, timestamp)
         if (result != 0) {
             Log.w(TAG, "发送音频数据失败: $result")
+            handleSocketError(result)
         }
     }
 

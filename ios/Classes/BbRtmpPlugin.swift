@@ -36,12 +36,23 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
     
+    // Background handling
+    private var isInBackground: Bool = false
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "com.bb.rtmp/plugin", binaryMessenger: registrar.messenger())
         let instance = BbRtmpPlugin()
         instance.channel = channel
         instance.textureRegistry = registrar.textures()
         registrar.addMethodCallDelegate(instance, channel: channel)
+        
+        // Ignore SIGPIPE to prevent app from being killed when writing to a broken socket
+        signal(SIGPIPE, SIG_IGN)
+        
+        // Register for lifecycle notifications
+        NotificationCenter.default.addObserver(instance, selector: #selector(instance.appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(instance, selector: #selector(instance.appWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
     }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -370,6 +381,52 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
         videoEncoder = nil
         audioEncoder = nil
     }
+    
+    // MARK: - Background Handling
+    
+    @objc private func appDidEnterBackground() {
+        print("[BbRtmpPlugin] App entered background")
+        isInBackground = true
+        
+        if rtmpStreamer?.isStreamingActive() == true {
+            beginBackgroundTask()
+            // Start sending frozen video frames to keep server/player happy
+            rtmpStreamer?.startHeartbeat()
+        }
+    }
+    
+    @objc private func appWillEnterForeground() {
+        print("[BbRtmpPlugin] App will enter foreground")
+        isInBackground = false
+        endBackgroundTask()
+        
+        // Stop background heartbeat
+        rtmpStreamer?.stopHeartbeat()
+        
+        // Force a keyframe to recover video quickly
+        if rtmpStreamer?.isStreamingActive() == true {
+            videoEncoder?.requestKeyFrame()
+        }
+    }
+    
+    private func beginBackgroundTask() {
+        guard backgroundTaskID == .invalid else { return }
+        
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "BbRtmpStreaming") { [weak self] in
+            print("[BbRtmpPlugin] Background task expired")
+            self?.endBackgroundTask()
+        }
+        
+        print("[BbRtmpPlugin] Background task started: \(backgroundTaskID)")
+    }
+    
+    private func endBackgroundTask() {
+        if backgroundTaskID != .invalid {
+            print("[BbRtmpPlugin] Ending background task: \(backgroundTaskID)")
+            UIApplication.shared.endBackgroundTask(backgroundTaskID)
+            backgroundTaskID = .invalid
+        }
+    }
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -382,13 +439,18 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let presentationTimeUs = Int64(CMTimeGetSeconds(presentationTime) * 1_000_000)
         
-        // Render into FBO
+        // 1. Skip everything video-related in background to avoid crashes (GPU/Encoder restricted)
+        if isInBackground {
+            return
+        }
+        
+        // 2. Render into FBO (GPU work)
         guard let targetBuffer = renderToFbo(pixelBuffer) else { return }
         
-        // Encode frame
+        // 3. Encode frame (Hardware Encoder work)
         videoEncoder?.encodeFrame(pixelBuffer: targetBuffer, presentationTimeUs: presentationTimeUs)
         
-        // Update preview texture
+        // 4. Update preview texture
         DispatchQueue.main.async { [weak self] in
             self?.previewTexture?.updateBuffer(targetBuffer)
         }

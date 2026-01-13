@@ -483,6 +483,11 @@ class CameraController(private val context: Context) {
     }
 
     /**
+     * 判断摄像头设备是否处于打开状态
+     */
+    fun isCameraDeviceOpen(): Boolean = cameraDevice != null
+
+    /**
      * 获取当前预览尺寸
      */
     fun getPreviewSize(): Size? = previewSize

@@ -5,6 +5,7 @@ class RtmpStreamer {
     private var rtmpWrapper: RtmpWrapper?
     private var rtmpUrl: String = ""
     private var isStreaming = false
+    private var isRefreshing = false
     private var startTime: Int64 = 0
     
     private var videoEncoder: VideoEncoder?
@@ -12,8 +13,22 @@ class RtmpStreamer {
     private var savedSps: Data?
     private var savedPps: Data?
     
+    // Heartbeat for background streaming
+    private var lastVideoData: Data?
+    private var lastVideoInfo: VideoEncoder.BufferInfo?
+    private var heartbeatTimer: DispatchSourceTimer?
+    private let heartbeatQueue = DispatchQueue(label: "com.bb_rtmp.heartbeat")
+    
     // Frame counters for logging
     private var videoFrameCount = 0
+    
+    // Cached metadata for reconnection
+    private var metaWidth: Int = 0
+    private var metaHeight: Int = 0
+    private var metaVideoBitrate: Int = 0
+    private var metaFps: Int = 0
+    private var metaAudioSampleRate: Int = 0
+    private var metaAudioChannels: Int = 0
     
     /**
      * Initialize RTMP streamer
@@ -50,6 +65,14 @@ class RtmpStreamer {
             return
         }
         
+        // Cache for reconnection
+        self.metaWidth = width
+        self.metaHeight = height
+        self.metaVideoBitrate = videoBitrate
+        self.metaFps = fps
+        self.metaAudioSampleRate = audioSampleRate
+        self.metaAudioChannels = audioChannels
+        
         let result = wrapper.setMetadata(
             withWidth: Int32(width),
             height: Int32(height),
@@ -76,7 +99,7 @@ class RtmpStreamer {
             return
         }
         
-        startTime = Int64(Date().timeIntervalSince1970 * 1_000_000) // microseconds
+        startTime = Int64(Date().timeIntervalSince1970 * 1000) // milliseconds
         isStreaming = true
         print("[\(tag)] Streaming started")
         
@@ -96,7 +119,39 @@ class RtmpStreamer {
         guard isStreaming else { return }
         
         isStreaming = false
+        stopHeartbeat()
         print("[\(tag)] Streaming stopped")
+    }
+    
+    func startHeartbeat() {
+        guard isStreaming, heartbeatTimer == nil else { return }
+        print("[\(tag)] Starting background video heartbeat")
+        
+        let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            self?.sendHeartbeatFrame()
+        }
+        timer.resume()
+        heartbeatTimer = timer
+    }
+    
+    func stopHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
+        print("[\(tag)] Stopped background video heartbeat")
+    }
+    
+    private func sendHeartbeatFrame() {
+        guard let data = lastVideoData, let info = lastVideoInfo else { return }
+        // Send heartbeat as non-keyframe but with updated stream timestamp
+        // This keeps the timeline moving without needing a full GOP refresh
+        sendVideoData(data: data, info: info, isKeyFrame: false)
+    }
+    
+    private func getStreamTimestamp() -> Int {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        return Int(now - startTime)
     }
     
     /**
@@ -133,7 +188,11 @@ class RtmpStreamer {
             return
         }
         
-        let timestamp = (Int64(Date().timeIntervalSince1970 * 1_000_000) - startTime) / 1000 // milliseconds
+        // Cache for heartbeat
+        lastVideoData = data
+        lastVideoInfo = info
+        
+        let timestamp = getStreamTimestamp()
         
         videoFrameCount += 1
         if isKeyFrame || videoFrameCount % 30 == 0 {
@@ -144,6 +203,7 @@ class RtmpStreamer {
         
         if result != 0 {
             print("[\(tag)] Failed to send video data: \(result)")
+            handleSocketError(result)
         }
     }
     
@@ -153,12 +213,13 @@ class RtmpStreamer {
     fileprivate func sendAudioData(data: Data, info: AudioEncoder.BufferInfo) {
         guard let wrapper = rtmpWrapper, isStreaming else { return }
         
-        let timestamp = (Int64(Date().timeIntervalSince1970 * 1_000_000) - startTime) / 1000 // milliseconds
+        let timestamp = getStreamTimestamp()
         
-        let result = wrapper.sendAudio(data, timestamp: Int(timestamp))
+        let result = wrapper.sendAudio(data, timestamp: timestamp)
         
         if result != 0 {
             print("[\(tag)] Failed to send audio data: \(result)")
+            handleSocketError(result)
         }
     }
     
@@ -207,6 +268,66 @@ class RtmpStreamer {
      */
     func isStreamingActive() -> Bool {
         return isStreaming
+    }
+    
+    private func handleSocketError(_ error: Int32) {
+        // Error 32: Broken pipe, Error 9: Bad file descriptor (socket reclaimed)
+        if (error == 32 || error == 9) && !isRefreshing {
+            print("[\(tag)] Critical socket error detected (\(error)). Stream is likely dead.")
+            // Trigger a refresh if we are currently trying to stream
+            if isStreaming {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.refreshConnection()
+                }
+            }
+        }
+    }
+    
+    /**
+     * Refresh the RTMP connection (e.g., after background transition socket loss)
+     */
+    func refreshConnection() {
+        guard isStreaming, let wrapper = rtmpWrapper, !isRefreshing else { return }
+        print("[\(tag)] Refreshing RTMP connection...")
+        isRefreshing = true
+        
+        // Use a background queue for reconnection to avoid blocking
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            defer { self.isRefreshing = false }
+            
+            // 1. Close old connection
+            wrapper.close()
+            
+            // 2. Wait a bit for server to clean up (e.g. SRS "disposing" state)
+            Thread.sleep(forTimeInterval: 1.5)
+            
+            // 3. Re-initialize
+            let result = wrapper.initialize(self.rtmpUrl)
+            
+            if result == 0 {
+                print("[\(self.tag)] RTMP connection refreshed successfully")
+                // Re-send SPS/PPS and set metadata
+                if let sps = self.savedSps, let pps = self.savedPps {
+                    self.sendSpsPps(sps: sps, pps: pps)
+                }
+                
+                // Re-apply metadata
+                if self.metaWidth > 0 {
+                    _ = wrapper.setMetadata(
+                        withWidth: Int32(self.metaWidth),
+                        height: Int32(self.metaHeight),
+                        videoBitrate: Int32(self.metaVideoBitrate),
+                        fps: Int32(self.metaFps),
+                        audioSampleRate: Int32(self.metaAudioSampleRate),
+                        audioChannels: Int32(self.metaAudioChannels)
+                    )
+                }
+            } else {
+                print("[\(self.tag)] Failed to refresh RTMP connection: \(result)")
+            }
+        }
     }
 }
 
