@@ -1,13 +1,14 @@
 #include "rtmp_wrapper.h"
 #include <android/log.h>
-#include "rtmp.h"
-#include "amf.h"
+#include "librtmp/rtmp.h"
+#include "librtmp/amf.h"
 #include <vector>
 #include <map>
 #include <mutex>
 #include <cstring>
 #include <cstdlib>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #define TAG "RtmpWrapper"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -489,8 +490,8 @@ rtmp_handle_t rtmp_init(const char *url) {
     RTMP_Init(rtmp);
     
     // 设置缓冲区和超时
-    RTMP_SetBufferMS(rtmp, 3600 * 1000);
-    rtmp->Link.timeout = 10; // 10 秒超时
+    RTMP_SetBufferMS(rtmp, 500); // 500ms 缓冲区，避免延迟累积
+    rtmp->Link.timeout = 5; // 5 秒连接超时
     
     char *url_copy = strdup(url);
     LOGD("调用 RTMP_SetupURL");
@@ -512,6 +513,9 @@ rtmp_handle_t rtmp_init(const char *url) {
     LOGD("RTMP_SetupURL 成功，调用 RTMP_EnableWrite");
     RTMP_EnableWrite(rtmp);
     
+    // 设置连接超时（5秒）
+    rtmp->Link.timeout = 5;
+    
     LOGD("尝试连接 RTMP 服务器...");
     if (!RTMP_Connect(rtmp, nullptr)) {
         LOGE("RTMP_Connect 失败，无法连接到服务器: %s", url);
@@ -522,7 +526,49 @@ rtmp_handle_t rtmp_init(const char *url) {
     }
     
     LOGD("RTMP_Connect 成功，尝试连接流...");
-    if (!RTMP_ConnectStream(rtmp, 0)) {
+    // 设置 socket 接收超时（确保每次读取都有超时限制）
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    if (setsockopt(rtmp->m_sb.sb_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) != 0) {
+        LOGE("设置 socket 接收超时失败");
+    }
+    
+    // 实现带超时的 RTMP_ConnectStream（因为原版可能会一直等待）
+    RTMPPacket packet = { 0 };
+    rtmp->m_mediaChannel = 0;
+    
+    while (!rtmp->m_bPlaying && RTMP_IsConnected(rtmp)) {
+        if (!RTMP_ReadPacket(rtmp, &packet)) {
+            // 读取失败，检查是否超时
+            if (RTMP_IsTimedout(rtmp)) {
+                LOGE("RTMP_ConnectStream 超时");
+                RTMPPacket_Free(&packet);
+                RTMP_Close(rtmp);
+                RTMP_Free(rtmp);
+                return 0;
+            }
+            // 其他错误，退出循环
+            break;
+        }
+        
+        if (RTMPPacket_IsReady(&packet)) {
+            if (!packet.m_nBodySize) {
+                continue;
+            }
+            if ((packet.m_packetType == RTMP_PACKET_TYPE_AUDIO) ||
+                (packet.m_packetType == RTMP_PACKET_TYPE_VIDEO) ||
+                (packet.m_packetType == RTMP_PACKET_TYPE_INFO)) {
+                RTMPPacket_Free(&packet);
+                continue;
+            }
+            
+            RTMP_ClientPacket(rtmp, &packet);
+            RTMPPacket_Free(&packet);
+        }
+    }
+    
+    if (!rtmp->m_bPlaying) {
         LOGE("RTMP_ConnectStream 失败，无法连接到流: %s", url);
         LOGE("  可能原因: 1) 流路径不正确 2) 服务器拒绝推流 3) 需要认证");
         LOGE("  请检查: app=%.*s, playpath=%.*s", 

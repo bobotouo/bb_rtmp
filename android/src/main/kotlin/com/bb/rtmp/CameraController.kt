@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.graphics.Rect
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -36,6 +37,8 @@ class CameraController(private val context: Context) {
     private var characteristics: CameraCharacteristics? = null
     private val cameraOpenCloseLock = Semaphore(1)
     private var stateCallback: CameraStateCallback? = null
+    private var currentRequestBuilder: CaptureRequest.Builder? = null
+    private var currentZoom: Float = 1.0f
 
     interface CameraStateCallback {
         fun onCameraOpened()
@@ -372,13 +375,31 @@ class CameraController(private val context: Context) {
 
         try {
             val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-            // 只添加 FBO 输入 Surface（previewSurface）
-            // 根据单 Surface 方案，Camera2 只输出到一个 Surface
+            currentRequestBuilder = requestBuilder
+            
+            // 添加 FBO 输入 Surface（previewSurface）
             previewSurface?.let { requestBuilder.addTarget(it) }
+            // 添加额外的 Surface（ImageReader 等，用于帧回调）
+            additionalSurfaces.forEach { requestBuilder.addTarget(it) }
+            Log.d(TAG, "捕获请求目标数: ${1 + additionalSurfaces.size} (预览 + ${additionalSurfaces.size} 个附加 Surface)")
 
             // 设置自动对焦
             requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            
+            // 初始化 zoom（如果支持）
+            characteristics?.let { chars ->
+                val maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
+                if (maxZoom > 1.0f) {
+                    val rect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    rect?.let {
+                        val zoomRatio = currentZoom.coerceIn(1.0f, maxZoom)
+                        val cropRegion = calculateZoomCropRegion(it, zoomRatio)
+                        requestBuilder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+                        Log.d(TAG, "初始化 zoom: $zoomRatio, crop region: $cropRegion")
+                    }
+                }
+            }
             
             // 设置 Camera Orientation（关键：告知 Camera 当前屏幕方向）
             // 这样 SurfaceTexture.getTransformMatrix() 才能给出正确的方向
@@ -528,6 +549,79 @@ class CameraController(private val context: Context) {
      */
     fun isFrontFacing(): Boolean {
         return characteristics?.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+    }
+    
+    /**
+     * 获取 zoom 范围
+     * @return Map 包含 minZoom, maxZoom, currentZoom
+     */
+    fun getZoomRange(): Map<String, Float> {
+        val chars = characteristics ?: return mapOf("minZoom" to 1.0f, "maxZoom" to 1.0f, "currentZoom" to 1.0f)
+        
+        val maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
+        val minZoom = 1.0f
+        
+        return mapOf(
+            "minZoom" to minZoom,
+            "maxZoom" to maxZoom,
+            "currentZoom" to currentZoom
+        )
+    }
+    
+    /**
+     * 设置 zoom
+     * @param zoom zoom 值，必须在 minZoom 和 maxZoom 之间
+     * @return 是否设置成功
+     */
+    fun setZoom(zoom: Float): Boolean {
+        val device = cameraDevice ?: return false
+        val session = captureSession ?: return false
+        val builder = currentRequestBuilder ?: return false
+        val chars = characteristics ?: return false
+        
+        val maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
+        val minZoom = 1.0f
+        
+        if (zoom < minZoom || zoom > maxZoom) {
+            Log.e(TAG, "Zoom 值超出范围: $zoom (范围: $minZoom - $maxZoom)")
+            return false
+        }
+        
+        try {
+            val rect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            if (rect == null) {
+                Log.e(TAG, "无法获取 SENSOR_INFO_ACTIVE_ARRAY_SIZE")
+                return false
+            }
+            
+            val cropRegion = calculateZoomCropRegion(rect, zoom)
+            builder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+            currentZoom = zoom
+            
+            session.setRepeatingRequest(builder.build(), null, null)
+            Log.d(TAG, "设置 zoom: $zoom, crop region: $cropRegion")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "设置 zoom 失败", e)
+            return false
+        }
+    }
+    
+    /**
+     * 计算 zoom 的 crop region
+     */
+    private fun calculateZoomCropRegion(activeArray: Rect, zoom: Float): Rect {
+        val centerX = activeArray.centerX()
+        val centerY = activeArray.centerY()
+        val width = (activeArray.width() / zoom).toInt()
+        val height = (activeArray.height() / zoom).toInt()
+        
+        val left = (centerX - width / 2).coerceAtLeast(activeArray.left)
+        val top = (centerY - height / 2).coerceAtLeast(activeArray.top)
+        val right = (left + width).coerceAtMost(activeArray.right)
+        val bottom = (top + height).coerceAtMost(activeArray.bottom)
+        
+        return Rect(left, top, right, bottom)
     }
     
     /**

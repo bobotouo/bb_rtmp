@@ -12,6 +12,8 @@ dependencies:
   bb_rtmp:
     path: ../
   permission_handler: ^11.0.0
+  yolo_flutter:
+    path: ../yolo_flutter
 
 dev_dependencies:
   flutter_test:
@@ -20,4 +22,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/
+    - assets/model/
 

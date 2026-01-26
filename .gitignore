@@ -91,3 +91,9 @@ IMPLEMENTATION_SUMMARY.md
 android/.cxx/Debug/o5j3k3d4/arm64-v8a/.ninja_log
 android/.cxx/Debug/o5j3k3d4/arm64-v8a/configure_fingerprint.bin
 .gitignore
+/android/.cxx/
+/android/.gradle/
+
+# Prebuilt libraries (构建产物，不提交到仓库)
+/prebuilt/
+/yolo_flutter/

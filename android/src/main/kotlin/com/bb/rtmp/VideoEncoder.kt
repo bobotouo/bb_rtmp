@@ -18,6 +18,12 @@ class VideoEncoder {
     private var surface: Surface? = null
     private val isEncoding = AtomicBoolean(false)
     private var encoderCallback: EncoderCallback? = null
+    private var encodeThread: Thread? = null
+    
+    // 保存 SPS/PPS，以便在设置回调时立即通知
+    private var savedSps: ByteArray? = null
+    private var savedPps: ByteArray? = null
+    private val spsPpsLock = Any()
     
     // 静态计数器用于日志（避免日志过多）
     private var staticOutputFrameCount = 0
@@ -31,6 +37,14 @@ class VideoEncoder {
 
     fun setCallback(callback: EncoderCallback) {
         this.encoderCallback = callback
+        
+        // 如果已经有保存的 SPS/PPS，立即通知回调
+        synchronized(spsPpsLock) {
+            if (savedSps != null && savedPps != null) {
+                Log.d(TAG, "设置回调时发现已有 SPS/PPS，立即通知: SPS size=${savedSps!!.size}, PPS size=${savedPps!!.size}")
+                callback.onCodecConfig(savedSps!!, savedPps!!)
+            }
+        }
     }
 
     /**
@@ -68,9 +82,10 @@ class VideoEncoder {
             isEncoding.set(true)
 
             // 启动编码线程
-            Thread {
+            encodeThread = Thread {
                 encodeLoop()
-            }.start()
+            }
+            encodeThread!!.start()
 
             Log.d(TAG, "视频编码器初始化成功: ${width}x${height}, bitrate=$bitrate, fps=$fps")
             return surface
@@ -85,10 +100,10 @@ class VideoEncoder {
      * 编码循环
      */
     private fun encodeLoop() {
-        val codec = mediaCodec ?: return
         val bufferInfo = MediaCodec.BufferInfo()
 
         while (isEncoding.get()) {
+            val codec = mediaCodec ?: break // 如果 codec 被释放，退出循环
             try {
                 val outputBufferId = codec.dequeueOutputBuffer(bufferInfo, 10000)
                 when {
@@ -131,8 +146,29 @@ class VideoEncoder {
                                 Log.d(TAG, "PPS 前8字节: $ppsHex")
                             }
                             
-                            // 通知编码器回调，传递 SPS/PPS
-                            encoderCallback?.onCodecConfig(spsArray, ppsArray)
+                            // 检查 SPS/PPS 是否改变（避免重复通知）
+                            var shouldNotify = false
+                            synchronized(spsPpsLock) {
+                                val hasChanged = savedSps == null || savedPps == null || 
+                                                !savedSps!!.contentEquals(spsArray) || 
+                                                !savedPps!!.contentEquals(ppsArray)
+                                
+                                if (hasChanged) {
+                                    savedSps = spsArray
+                                    savedPps = ppsArray
+                                    shouldNotify = true
+                                }
+                            }
+                            
+                            // 只在改变时通知回调（检查回调是否仍然有效）
+                            val callback = encoderCallback
+                            if (shouldNotify && callback != null) {
+                                try {
+                                    callback.onCodecConfig(spsArray, ppsArray)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "SPS/PPS 回调异常（可能已释放）", e)
+                                }
+                            }
                         } else {
                             Log.w(TAG, "MediaFormat 中未找到 SPS/PPS (csd-0/csd-1)")
                         }
@@ -180,7 +216,15 @@ class VideoEncoder {
                                 }
                             }
                             
-                            encoderCallback?.onEncodedData(data, bufferInfo)
+                            // 安全调用回调（检查回调是否仍然有效）
+                            val callback = encoderCallback
+                            if (callback != null) {
+                                try {
+                                    callback.onEncodedData(data, bufferInfo)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "编码数据回调异常（可能已释放）", e)
+                                }
+                            }
                         } else {
                             if (bufferInfo.size == 0) {
                                 // 每 30 次打印一次警告（避免日志过多）
@@ -239,13 +283,27 @@ class VideoEncoder {
      * 释放编码器
      */
     fun release() {
+        // 1. 先清除回调，防止回调在释放后继续执行
+        encoderCallback = null
+        
+        // 2. 停止编码
         isEncoding.set(false)
+        
+        // 3. 等待编码线程结束
+        encodeThread?.join(1000) // 最多等待 1 秒
+        encodeThread = null
+        
+        // 4. 释放 MediaCodec 和 Surface
         try {
             mediaCodec?.stop()
             mediaCodec?.release()
             mediaCodec = null
             surface?.release()
             surface = null
+            synchronized(spsPpsLock) {
+                savedSps = null
+                savedPps = null
+            }
             Log.d(TAG, "视频编码器已释放")
         } catch (e: Exception) {
             Log.e(TAG, "释放视频编码器失败", e)

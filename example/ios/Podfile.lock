@@ -4,11 +4,14 @@ PODS:
   - Flutter (1.0.0)
   - permission_handler_apple (9.3.0):
     - Flutter
+  - yolo_flutter (0.0.1):
+    - Flutter
 
 DEPENDENCIES:
   - bb_rtmp (from `.symlinks/plugins/bb_rtmp/ios`)
   - Flutter (from `Flutter`)
   - permission_handler_apple (from `.symlinks/plugins/permission_handler_apple/ios`)
+  - yolo_flutter (from `.symlinks/plugins/yolo_flutter/ios`)
 
 EXTERNAL SOURCES:
   bb_rtmp:
@@ -17,11 +20,14 @@ EXTERNAL SOURCES:
     :path: Flutter
   permission_handler_apple:
     :path: ".symlinks/plugins/permission_handler_apple/ios"
+  yolo_flutter:
+    :path: ".symlinks/plugins/yolo_flutter/ios"
 
 SPEC CHECKSUMS:
   bb_rtmp: 0e9bc98e116b9340c444bf193d728c4126966672
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   permission_handler_apple: 4ed2196e43d0651e8ff7ca3483a069d469701f2d
+  yolo_flutter: 5ed640137d01f63523093a5badf356b98d4aeaa7
 
 PODFILE CHECKSUM: c4e6b4874881de2192cd85dcd3885d0bed577cb4
 

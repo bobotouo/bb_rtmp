@@ -100,6 +100,7 @@ class AudioEncoder {
         val inputBuffers = arrayOfNulls<ByteBuffer>(0) // MediaCodec.getInputBuffers() 已废弃，使用新 API
 
         while (isEncoding.get()) {
+            val codec = mediaCodec ?: break // 如果 codec 被释放，退出循环
             try {
                 // 获取输入缓冲区
                 val inputBufferId = codec.dequeueInputBuffer(10000)
@@ -142,7 +143,15 @@ class AudioEncoder {
                             
                             // 创建只读副本
                             val data = outputBuffer.slice()
-                            encoderCallback?.onEncodedData(data, bufferInfo)
+                            // 安全调用回调（检查回调是否仍然有效）
+                            val callback = encoderCallback
+                            if (callback != null) {
+                                try {
+                                    callback.onEncodedData(data, bufferInfo)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "编码数据回调异常（可能已释放）", e)
+                                }
+                            }
                         }
                         codec.releaseOutputBuffer(outputBufferId, false)
                     }
@@ -167,8 +176,13 @@ class AudioEncoder {
      * 释放编码器
      */
     fun release() {
+        // 1. 先清除回调，防止回调在释放后继续执行
+        encoderCallback = null
+        
+        // 2. 停止编码
         isEncoding.set(false)
         
+        // 3. 等待录音线程结束
         try {
             recordThread?.join(1000)
             recordThread = null
@@ -176,6 +190,7 @@ class AudioEncoder {
             Log.e(TAG, "等待录音线程结束失败", e)
         }
 
+        // 4. 释放 AudioRecord
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -184,6 +199,7 @@ class AudioEncoder {
             Log.e(TAG, "释放 AudioRecord 失败", e)
         }
 
+        // 5. 释放 MediaCodec
         try {
             mediaCodec?.stop()
             mediaCodec?.release()

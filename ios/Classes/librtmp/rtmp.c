@@ -29,6 +29,11 @@
 #include <assert.h>
 #include <time.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/select.h>
+#include <errno.h>
+#endif
 
 #include "rtmp_sys.h"
 #include "log.h"
@@ -914,6 +919,66 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
   r->m_sb.sb_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (r->m_sb.sb_socket != -1)
     {
+      // 在 connect 之前设置 socket 超时（使用 SO_SNDTIMEO）
+      // 注意：某些系统上 SO_SNDTIMEO 对 connect 可能无效，所以使用非阻塞 + select
+#ifndef _WIN32
+      // 设置 socket 为非阻塞模式
+      int flags = fcntl(r->m_sb.sb_socket, F_GETFL, 0);
+      if (flags >= 0) {
+        fcntl(r->m_sb.sb_socket, F_SETFL, flags | O_NONBLOCK);
+      }
+      
+      // 尝试连接
+      int connectResult = connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr));
+      if (connectResult < 0) {
+        int err = GetSockError();
+        if (err == EINPROGRESS || err == EWOULDBLOCK || err == EAGAIN) {
+          // 连接正在进行中，使用 select 等待超时
+          fd_set writefds;
+          struct timeval timeout;
+          FD_ZERO(&writefds);
+          FD_SET(r->m_sb.sb_socket, &writefds);
+          timeout.tv_sec = r->Link.timeout;
+          timeout.tv_usec = 0;
+          
+          int selectResult = select(r->m_sb.sb_socket + 1, NULL, &writefds, NULL, &timeout);
+          if (selectResult > 0 && FD_ISSET(r->m_sb.sb_socket, &writefds)) {
+            // 连接成功，检查是否有错误
+            int sockerr = 0;
+            socklen_t len = sizeof(sockerr);
+            if (getsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_ERROR, (char *)&sockerr, &len) == 0 && sockerr == 0) {
+              // 连接成功，恢复阻塞模式
+              fcntl(r->m_sb.sb_socket, F_SETFL, flags);
+              connectResult = 0;
+            } else {
+              err = sockerr;
+              connectResult = -1;
+            }
+          } else {
+            // 超时或错误
+            RTMP_Log(RTMP_LOGERROR, "%s, connect timeout after %ds", __FUNCTION__, r->Link.timeout);
+            RTMP_Close(r);
+            return FALSE;
+          }
+        }
+        
+        if (connectResult < 0) {
+          RTMP_Log(RTMP_LOGERROR, "%s, failed to connect socket. %d (%s)",
+              __FUNCTION__, err, strerror(err));
+          RTMP_Close(r);
+          return FALSE;
+        }
+      } else {
+        // 立即连接成功，恢复阻塞模式
+        fcntl(r->m_sb.sb_socket, F_SETFL, flags);
+      }
+#else
+      // Windows: 使用 SO_SNDTIMEO（Windows 上对 connect 有效）
+      struct timeval tv;
+      tv.tv_sec = r->Link.timeout;
+      tv.tv_usec = 0;
+      setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv));
+      
       if (connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr)) < 0)
 	{
 	  int err = GetSockError();
@@ -922,6 +987,7 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
 	  RTMP_Close(r);
 	  return FALSE;
 	}
+#endif
 
       if (r->Link.socksport)
 	{

@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:bb_rtmp/bb_rtmp.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:yolo_flutter/yolo_flutter.dart';
 
 void main() {
   runApp(const MyApp());
@@ -34,6 +37,16 @@ class _MyAppState extends State<MyApp> {
   Orientation? _currentOrientation; // 当前屏幕方向
   String _initialCameraFacing = 'front'; // 初始摄像头方向
 
+  StreamSubscription<dynamic>? _frameSubscription;
+  // YOLO Flutter 插件
+  final YoloFlutter _yolo = YoloFlutter();
+  final ikunLabels = ['basketball', 'player', 'referee', 'hoop', 'backboard'];
+
+  // 检测结果
+  List<Map<String, dynamic>> _detections = [];
+  int _detectionSourceWidth = 1920;
+  int _detectionSourceHeight = 1080;
+
   @override
   void initState() {
     super.initState();
@@ -42,6 +55,28 @@ class _MyAppState extends State<MyApp> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _updateOrientation();
     });
+    // 先初始化模型
+    initOurModel();
+  }
+
+  initOurModel() async {
+    try {
+      // 初始化 YOLO 插件
+      await _yolo.initialize();
+
+      // 加载模型（与 rootBundle.load 相同的 asset 路径，原生层用 FlutterLoader 解析）
+      final result = await _yolo.loadModel(
+        paramPath: 'assets/model/yolo11n.ncnn.param',
+        binPath: 'assets/model/yolo11n.ncnn.bin',
+        useGpu: false, // 使用 GPU 推理
+        numThreads: 4,
+      );
+      if (!result) {
+        debugPrint('YOLO 模型初始化失败');
+      }
+    } catch (e) {
+      debugPrint('YOLO 模型初始化异常: $e');
+    }
   }
 
   /// 请求摄像头和麦克风权限
@@ -106,7 +141,6 @@ class _MyAppState extends State<MyApp> {
     });
 
     try {
-      // 竖屏推流使用 9:16 比例（如 720x1280、1080x1920），符合抖音、TikTok、视频号等主流平台标准
       // 横屏推流使用 16:9 比例（如 1280x720、1920x1080）
       // GOP 已在编码器中设置为 2 秒
       int finalWidth = _currentWidth;
@@ -137,9 +171,20 @@ class _MyAppState extends State<MyApp> {
             _streamStatus!.height > 0) {
           setState(() {
             _previewAspectRatio = _streamStatus!.width / _streamStatus!.height;
-            print('宽高比: $_previewAspectRatio');
           });
         }
+
+        // 打开原始帧回调
+        await BbRtmp.enableFrameCallback(true);
+        // 只监听 FBO RGBA 数据（用于 YOLO 检测），自动释放 NV12 句柄
+        _frameSubscription = BbRtmp.listenToFrames(
+          types: {FrameType.fboRgba},
+          onFboRgba: (Map<String, dynamic> fboRgba) {
+            // 处理 FBO RGBA 数据（用于 YOLO 检测）
+            _processFboRgba(fboRgba);
+          },
+          autoReleaseNv12: true, // 自动释放 NV12 句柄（虽然我们不监听，但设置以防万一）
+        );
       } else {
         setState(() {
           _statusMessage = '初始化失败：未返回纹理 ID';
@@ -150,6 +195,88 @@ class _MyAppState extends State<MyApp> {
         _statusMessage = '初始化失败: $e';
       });
       _showMessage('初始化失败: $e');
+    }
+  }
+
+  // 并发控制：限制同时处理的检测任务数量，避免堆积
+  bool _isProcessingDetection = false;
+  int _pendingDetections = 0;
+  static const int maxPendingDetections = 2; // 最多 2 个待处理任务
+
+  void _processFboRgba(Map<String, dynamic> eventData) async {
+    try {
+      if (eventData['type'] != 'fbo_rgba') return;
+
+      // 并发限制：如果已有太多待处理任务，丢弃当前帧，避免堆积
+      if (_pendingDetections >= maxPendingDetections ||
+          _isProcessingDetection) {
+        return; // 丢弃帧，避免内存和性能问题
+      }
+
+      // 指针可能由 MethodChannel 以 Int/Number 传来，需保留 64 位
+      final addressValue = eventData['address'];
+      final address = addressValue is int
+          ? addressValue
+          : (addressValue is num ? addressValue.round() : null);
+      final width = eventData['width'] as int?;
+      final height = eventData['height'] as int?;
+      final stride = eventData['stride'] as int?;
+
+      if (address == null ||
+          width == null ||
+          height == null ||
+          stride == null) {
+        return;
+      }
+
+      // 标记为处理中
+      _isProcessingDetection = true;
+      _pendingDetections++;
+
+      // 使用 yolo_flutter 插件进行检测
+      // Android: flipVertical=false - glReadPixels 数据是上下颠倒的（OpenGL 坐标系左下角为原点）
+      //          C++ 层会在返回前将 y 坐标从颠倒图像坐标系转为正常图像坐标系
+      // iOS: flipVertical=false - CVPixelBuffer 原点是左上角（Top-Left），数据是正常方向
+      //      原生层（yolo_bridge.mm）会在返回前翻转 y 坐标以匹配 UI 坐标系
+      // 坐标转换已在各自的原生层处理，Dart 层统一使用 flipVertical=false
+      final detections = await _yolo.detectRgbaPointer(
+        address,
+        width,
+        height,
+        stride: stride,
+        flipVertical: false, // Android 和 iOS 都使用 false，坐标转换在各自原生层处理
+      );
+
+      // 更新检测结果（坐标转换已在原生层处理，直接使用）
+      if (mounted) {
+        if (detections.isNotEmpty) {
+          setState(() {
+            _detections = detections
+                .map((d) => {
+                      'x': d.x,
+                      'y': d.y,
+                      'width': d.width,
+                      'height': d.height,
+                      'label': d.label,
+                      'prob': d.confidence,
+                    })
+                .toList();
+            _detectionSourceWidth = width;
+            _detectionSourceHeight = height;
+          });
+        } else {
+          setState(() {
+            _detections = [];
+          });
+        }
+      }
+    } catch (e) {
+      // 记录错误但不阻塞
+      debugPrint('检测错误: $e');
+    } finally {
+      // 确保状态重置
+      _isProcessingDetection = false;
+      _pendingDetections = _pendingDetections > 0 ? _pendingDetections - 1 : 0;
     }
   }
 
@@ -247,7 +374,6 @@ class _MyAppState extends State<MyApp> {
 
     try {
       final status = await BbRtmp.getStatus();
-      print('状态: ${status.toString()}');
       setState(() {
         _streamStatus = status;
         // 更新预览宽高比（使用实际预览分辨率，从实际帧获取）
@@ -255,8 +381,6 @@ class _MyAppState extends State<MyApp> {
           _previewWidth = status.previewWidth;
           _previewHeight = status.previewHeight;
           _previewAspectRatio = _previewWidth / _previewHeight;
-          print(
-              '更新预览尺寸: ${_previewWidth}x$_previewHeight, 比例: $_previewAspectRatio');
         } else if (status.width > 0 && status.height > 0) {
           // 兼容旧版本，如果没有 previewWidth/previewHeight，使用 width/height
           _previewWidth = status.width;
@@ -281,6 +405,11 @@ class _MyAppState extends State<MyApp> {
     if (_isStreaming) {
       await _stopStreaming();
     }
+
+    // 释放帧回调
+    _frameSubscription?.cancel();
+    _frameSubscription = null;
+    await BbRtmp.enableFrameCallback(false);
 
     try {
       await BbRtmp.release();
@@ -308,8 +437,7 @@ class _MyAppState extends State<MyApp> {
         ),
       );
     } catch (e) {
-      // 如果 ScaffoldMessenger 不可用，使用 print 作为后备
-      print('消息: $message');
+      // 如果 ScaffoldMessenger 不可用，静默忽略
     }
   }
 
@@ -461,24 +589,40 @@ class _MyAppState extends State<MyApp> {
                 ),
               ),
 
-              // 预览区域（使用 FBO 画布宽高比，FBO 已经处理了旋转/镜像/裁剪）
-              // Camera → FBO（旋转/镜像/裁剪）→ 预览 SurfaceTexture → Flutter Texture
+              // 预览区域（叠加检测框）
               Container(
                 width: double.infinity,
                 color: Colors.black,
                 child: _textureId != null &&
                         _previewWidth > 0 &&
                         _previewHeight > 0
-                    ? Builder(builder: (context) {
-                        print(
-                            'Building Preview: texture=$_textureId, size=${_previewWidth}x$_previewHeight, aspect=$_previewAspectRatio');
-                        return Center(
-                          child: AspectRatio(
-                            aspectRatio: _previewAspectRatio,
-                            child: CameraPreview(textureId: _textureId!),
+                    ? Center(
+                        child: AspectRatio(
+                          aspectRatio: _previewAspectRatio,
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              return Stack(
+                                children: [
+                                  // 摄像头预览
+                                  CameraPreview(textureId: _textureId!),
+                                  // 检测框叠加层
+                                  if (_detections.isNotEmpty)
+                                    CustomPaint(
+                                      size: Size(constraints.maxWidth,
+                                          constraints.maxHeight),
+                                      painter: DetectionPainter(
+                                        detections: _detections,
+                                        sourceWidth: _detectionSourceWidth,
+                                        sourceHeight: _detectionSourceHeight,
+                                        labels: ikunLabels,
+                                      ),
+                                    ),
+                                ],
+                              );
+                            },
                           ),
-                        );
-                      })
+                        ),
+                      )
                     : const Center(
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
@@ -783,5 +927,92 @@ class _MyAppState extends State<MyApp> {
       ),
       child: Text(label),
     );
+  }
+}
+
+/// 检测框绘制器
+class DetectionPainter extends CustomPainter {
+  final List<Map<String, dynamic>> detections;
+  final int sourceWidth;
+  final int sourceHeight;
+  final List<String> labels;
+
+  DetectionPainter({
+    required this.detections,
+    required this.sourceWidth,
+    required this.sourceHeight,
+    required this.labels,
+  });
+
+  // 不同类别的颜色
+  static const List<Color> colors = [
+    Colors.red,
+    Colors.green,
+    Colors.blue,
+    Colors.orange,
+    Colors.purple,
+    Colors.cyan,
+    Colors.pink,
+    Colors.amber,
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final scaleX = size.width / sourceWidth;
+    final scaleY = size.height / sourceHeight;
+
+    for (final det in detections) {
+      final x = (det['x'] as num).toDouble() * scaleX;
+      final y = (det['y'] as num).toDouble() * scaleY;
+      final w = (det['width'] as num).toDouble() * scaleX;
+      final h = (det['height'] as num).toDouble() * scaleY;
+      final labelIdx = (det['label'] as num).toInt();
+      final prob = (det['prob'] as num).toDouble();
+
+      // 获取颜色和标签
+      final color = colors[labelIdx % colors.length];
+      final labelText =
+          labelIdx < labels.length ? labels[labelIdx] : 'class$labelIdx';
+
+      // 绘制边框
+      final paint = Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+
+      canvas.drawRect(Rect.fromLTWH(x, y, w, h), paint);
+
+      // 绘制标签背景
+      final textSpan = TextSpan(
+        text: '$labelText ${(prob * 100).toStringAsFixed(0)}%',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+        ),
+      );
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
+
+      final bgPaint = Paint()..color = color;
+      final bgRect = Rect.fromLTWH(
+        x,
+        y - textPainter.height - 4,
+        textPainter.width + 8,
+        textPainter.height + 4,
+      );
+      canvas.drawRect(bgRect, bgPaint);
+
+      // 绘制文字
+      textPainter.paint(canvas, Offset(x + 4, y - textPainter.height - 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(DetectionPainter oldDelegate) {
+    return detections != oldDelegate.detections;
   }
 }

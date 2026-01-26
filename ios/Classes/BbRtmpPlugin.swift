@@ -5,9 +5,13 @@ import VideoToolbox
 import CoreVideo
 import Accelerate
 
-public class BbRtmpPlugin: NSObject, FlutterPlugin {
+@objc public class BbRtmpPlugin: NSObject, FlutterPlugin {
     private var channel: FlutterMethodChannel?
     private var textureRegistry: FlutterTextureRegistry?
+    private var frameEventChannel: FlutterEventChannel?
+    private var frameEventSink: FlutterEventSink?
+    private var statusEventChannel: FlutterEventChannel?
+    private var statusEventSink: FlutterEventSink?
     
     private var videoEncoder: VideoEncoder?
     private var audioEncoder: AudioEncoder?
@@ -36,16 +40,57 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
     
+    // Frame callback
+    private var enableFrameCallback: Bool = false
+    private var frameCounter: Int64 = 0
+    private var frameSkip: Int = 0 // 跳帧数，0 表示不跳帧（每帧都回调），默认 0
+    private let fboReadWarmupMs: Int64 = 2000 // 延迟 2 秒后再发送，避免相机未稳定时读到全黑
+    private var fboLoopStartTime: Int64 = 0 // FBO 循环开始时间（毫秒）
+    
+    // 保持 buffer 引用，防止被重用，确保地址稳定（零拷贝）
+    // 使用固定大小的环形池，控制内存占用
+    private var activeBuffers: [CVPixelBuffer] = [] // 活跃的 buffer 引用（环形池）
+    private let maxActiveBuffers: Int = 4 // 最多保持 4 个 buffer 引用（环形池，固定大小）
+    private let bufferQueueLock = NSLock()
+    private var bufferTimestamps: [CVPixelBuffer: Int64] = [:] // buffer 时间戳，用于超时清理
+    private let bufferMaxAgeMs: Int64 = 3000 // buffer 最大存活时间 3 秒（超时自动清理）
+    
     // Background handling
     private var isInBackground: Bool = false
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     
-    public static func register(with registrar: FlutterPluginRegistrar) {
+    // Helper methods for StatusStreamHandler to access private properties
+    func setFrameEventSink(_ sink: FlutterEventSink?) {
+        frameEventSink = sink
+        if sink != nil {
+            enableFrameCallback = true
+            frameCounter = 0
+            fboLoopStartTime = 0
+        } else {
+            enableFrameCallback = false
+            frameCounter = 0
+            fboLoopStartTime = 0
+        }
+    }
+    
+    func setStatusEventSink(_ sink: FlutterEventSink?) {
+        statusEventSink = sink
+    }
+    
+    @objc public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "com.bb.rtmp/plugin", binaryMessenger: registrar.messenger())
         let instance = BbRtmpPlugin()
         instance.channel = channel
         instance.textureRegistry = registrar.textures()
         registrar.addMethodCallDelegate(instance, channel: channel)
+        
+        // Register EventChannel for frame data
+        instance.frameEventChannel = FlutterEventChannel(name: "com.bb.rtmp/frames", binaryMessenger: registrar.messenger())
+        instance.frameEventChannel?.setStreamHandler(StatusStreamHandler(plugin: instance, isFrameChannel: true))
+        
+        // Register EventChannel for streaming status
+        instance.statusEventChannel = FlutterEventChannel(name: "com.bb.rtmp/status", binaryMessenger: registrar.messenger())
+        instance.statusEventChannel?.setStreamHandler(StatusStreamHandler(plugin: instance, isFrameChannel: false))
         
         // Ignore SIGPIPE to prevent app from being killed when writing to a broken socket
         signal(SIGPIPE, SIG_IGN)
@@ -57,10 +102,12 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
+        case "initializePreview":
+            initializePreview(call: call, result: result)
         case "initialize":
             initialize(call: call, result: result)
         case "startStreaming":
-            startStreaming(result: result)
+            startStreaming(call: call, result: result)
         case "stopStreaming":
             stopStreaming(result: result)
         case "release":
@@ -74,9 +121,46 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
             setBitrate(call: call, result: result)
         case "getStatus":
             getStatus(result: result)
+        case "enableFrameCallback":
+            enableFrameCallback(call: call, result: result)
+        case "releasePixelBufferHandle":
+            releasePixelBufferHandle(call: call, result: result)
+        case "getZoomRange":
+            getZoomRange(result: result)
+        case "setZoom":
+            setZoom(call: call, result: result)
+        case "stopPreview":
+            stopPreview()
+            result(nil)
         default:
             result(FlutterMethodNotImplemented)
         }
+    }
+    
+    /**
+     * 初始化预览（不包含推流）
+     * 类似于 Android 的实现，将参数包装后调用 initialize 方法
+     */
+    private func initializePreview(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any] else {
+            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Invalid arguments", details: nil))
+            return
+        }
+        
+        // 创建一个包含预览参数的 Map，然后用 FlutterMethodCall 构造函数
+        let previewArgs: [String: Any] = [
+            "rtmpUrl": "",  // 空 URL，跳过 RTMP 初始化
+            "width": args["width"] as? Int ?? 1920,
+            "height": args["height"] as? Int ?? 1080,
+            "bitrate": 2_000_000,  // 默认码率（预览时不重要）
+            "fps": args["fps"] as? Int ?? 30,
+            "enableAudio": false,  // 预览时不需要音频
+            "isPortrait": args["isPortrait"] as? Bool ?? false,
+            "initialCameraFacing": args["initialCameraFacing"] as? String ?? "front"
+        ]
+        let previewCall = FlutterMethodCall(methodName: "initialize", arguments: previewArgs)
+        
+        initialize(call: previewCall, result: result)
     }
     
     private func initialize(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -147,21 +231,30 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
             }
         }
         
-        // Initialize RTMP streamer
-        rtmpStreamer = RtmpStreamer()
-        guard let rtmpStreamer = rtmpStreamer, rtmpStreamer.initialize(url: rtmpUrl, videoEncoder: videoEncoder, audioEncoder: audioEncoder) else {
-            result(FlutterError(code: "RTMP_INIT_FAILED", message: "Failed to initialize RTMP", details: nil))
-            return
+        // Initialize RTMP streamer only if URL is not empty
+        if !rtmpUrl.isEmpty {
+            rtmpStreamer = RtmpStreamer()
+            // 设置状态回调
+            rtmpStreamer?.setStatusCallback { [weak self] status, error in
+                self?.notifyStreamingStatus(status: status, error: error)
+            }
+            guard let rtmpStreamer = rtmpStreamer, rtmpStreamer.initialize(url: rtmpUrl, videoEncoder: videoEncoder, audioEncoder: audioEncoder) else {
+                result(FlutterError(code: "RTMP_INIT_FAILED", message: "Failed to initialize RTMP", details: nil))
+                return
+            }
+            
+            // Set metadata with FORCED LANDSCAPE dimensions
+            let audioSampleRate = audioEncoder?.getSampleRate() ?? 44100
+            let audioChannels = audioEncoder?.getChannelCount() ?? 1
+            rtmpStreamer.setMetadata(width: self.streamWidth, height: self.streamHeight, videoBitrate: bitrate, fps: fps, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
+            
+            // Initialize bitrate controller
+            bitrateController = BitrateController(videoEncoder: videoEncoder, rtmpStreamer: rtmpStreamer)
+            bitrateController?.initialize(initialBitrate: bitrate, width: self.streamWidth, height: self.streamHeight)
+        } else {
+            // Empty URL: preview mode, set encoder callback later in startStreaming
+            // Note: VideoEncoder will save SPS/PPS and notify when callback is set
         }
-        
-        // Set metadata with FORCED LANDSCAPE dimensions
-        let audioSampleRate = audioEncoder?.getSampleRate() ?? 44100
-        let audioChannels = audioEncoder?.getChannelCount() ?? 1
-        rtmpStreamer.setMetadata(width: self.streamWidth, height: self.streamHeight, videoBitrate: bitrate, fps: fps, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
-        
-        // Initialize bitrate controller
-        bitrateController = BitrateController(videoEncoder: videoEncoder, rtmpStreamer: rtmpStreamer)
-        bitrateController?.initialize(initialBitrate: bitrate, width: self.streamWidth, height: self.streamHeight)
         
         // Setup camera
         setupCamera(isFront: isFront, width: self.streamWidth, height: self.streamHeight, fps: fps) { [weak self] success in
@@ -180,7 +273,13 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
         guard let connection = output.connection(with: .video) else { return }
         
         if connection.isVideoOrientationSupported {
-            connection.videoOrientation = isPortrait ? .portrait : .landscapeLeft
+            // 使用 portraitUpsideDown 和 landscapeRight 来修正预览方向
+            // 虽然看起来怪异，但方向是正确的
+            if isPortrait {
+                connection.videoOrientation = .portraitUpsideDown
+            } else {
+                connection.videoOrientation = .landscapeRight
+            }
         }
         
         if connection.isVideoMirroringSupported {
@@ -266,16 +365,128 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
         }
     }
     
-    private func startStreaming(result: @escaping FlutterResult) {
-        rtmpStreamer?.start()
-        bitrateController?.start()
+    private func startStreaming(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        // Get RTMP URL from arguments if provided
+        var newRtmpUrl = rtmpUrl
+        var enableAudio = true
+        if let args = call.arguments as? [String: Any] {
+            if let url = args["rtmpUrl"] as? String, !url.isEmpty {
+                newRtmpUrl = url
+                self.rtmpUrl = url
+            }
+            enableAudio = args["enableAudio"] as? Bool ?? true
+        }
+        
+        // Check if RTMP URL is provided
+        if newRtmpUrl.isEmpty {
+            result(FlutterError(code: "NO_RTMP_URL", message: "RTMP URL not provided", details: nil))
+            return
+        }
+        
+        guard let videoEncoder = videoEncoder else {
+            result(FlutterError(code: "NOT_INITIALIZED", message: "Video encoder not initialized", details: nil))
+            return
+        }
+        
+        // 立即返回，不等待连接完成
         result(nil)
+        
+        // 发送连接中状态
+        notifyStreamingStatus(status: "connecting", error: nil)
+        
+        // 在后台线程中初始化 RTMP 连接
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            // Check if RTMP streamer needs to be initialized
+            if self.rtmpStreamer == nil {
+                // 初始化音频编码器（如果需要且未初始化）
+                if enableAudio && self.audioEncoder == nil {
+                    self.audioEncoder = AudioEncoder()
+                    if !(self.audioEncoder?.initialize() ?? false) {
+                        print("[BbRtmpPlugin] Failed to initialize audio encoder")
+                        self.audioEncoder = nil
+                    }
+                }
+                
+                // Initialize RTMP streamer
+                self.rtmpStreamer = RtmpStreamer()
+                // 设置状态回调
+                self.rtmpStreamer?.setStatusCallback { [weak self] status, error in
+                    self?.notifyStreamingStatus(status: status, error: error)
+                }
+                guard let rtmpStreamer = self.rtmpStreamer, rtmpStreamer.initialize(url: newRtmpUrl, videoEncoder: videoEncoder, audioEncoder: self.audioEncoder) else {
+                    self.notifyStreamingStatus(status: "failed", error: "Failed to initialize RTMP")
+                    self.rtmpStreamer = nil
+                    return
+                }
+                
+                // Set metadata
+                let audioSampleRate = self.audioEncoder?.getSampleRate() ?? 44100
+                let audioChannels = self.audioEncoder?.getChannelCount() ?? 1
+                let bitrate = self.bitrateController?.getCurrentBitrate() ?? 2_000_000
+                rtmpStreamer.setMetadata(width: self.streamWidth, height: self.streamHeight, videoBitrate: bitrate, fps: 30, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
+                
+                // Initialize bitrate controller
+                self.bitrateController = BitrateController(videoEncoder: videoEncoder, rtmpStreamer: rtmpStreamer)
+                self.bitrateController?.initialize(initialBitrate: bitrate, width: self.streamWidth, height: self.streamHeight)
+            }
+            
+            self.rtmpStreamer?.start()
+            self.bitrateController?.start()
+            
+            // 发送连接成功状态
+            self.notifyStreamingStatus(status: "connected", error: nil)
+        }
+    }
+    
+    /**
+     * 通知推流状态变化
+     */
+    private func notifyStreamingStatus(status: String, error: String?) {
+        guard let sink = statusEventSink else { return }
+        // EventChannel 必须在主线程发送
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let sink = self.statusEventSink else { return }
+            var statusMap: [String: Any] = ["status": status]
+            if let error = error {
+                statusMap["error"] = error
+            }
+            sink(statusMap)
+        }
     }
     
     private func stopStreaming(result: @escaping FlutterResult) {
         rtmpStreamer?.stop()
         bitrateController?.stop()
+        notifyStreamingStatus(status: "stopped", error: nil)
         result(nil)
+    }
+    
+    /**
+     * 停止预览并销毁 Texture
+     */
+    private func stopPreview() {
+        print("[BbRtmpPlugin] stopPreview")
+        captureSession?.stopRunning()
+        // 不要把 captureSession 设为 nil，防止 release 时重复操作或导致其它问题
+        // 但为了彻底停止，我们可以移除 input 和 output
+        if let session = captureSession {
+            session.beginConfiguration()
+            if let input = videoInput {
+                session.removeInput(input)
+                videoInput = nil
+            }
+            if let output = videoOutput {
+                session.removeOutput(output)
+                videoOutput = nil
+            }
+            session.commitConfiguration()
+        }
+        captureSession = nil
+        
+        previewTexture?.release()
+        previewTexture = nil
     }
     
     private func switchCamera(result: @escaping FlutterResult) {
@@ -376,6 +587,16 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
         ciContext = nil
         fboBufferPool = nil
         
+        // 清理活跃的 buffer 引用
+        bufferQueueLock.lock()
+        for buffer in activeBuffers {
+            CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags.readOnly)
+            // Swift 会自动释放引用（当从数组中移除时）
+        }
+        activeBuffers.removeAll()
+        bufferTimestamps.removeAll()
+        bufferQueueLock.unlock()
+        
         bitrateController = nil
         rtmpStreamer = nil
         videoEncoder = nil
@@ -427,6 +648,132 @@ public class BbRtmpPlugin: NSObject, FlutterPlugin {
             backgroundTaskID = .invalid
         }
     }
+    
+    // MARK: - Frame Callback Methods
+    
+    private func enableFrameCallback(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any] else {
+            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Invalid arguments", details: nil))
+            return
+        }
+        
+        let enable = args["enable"] as? Bool ?? false
+        let skipFrame = args["skipFrame"] as? Int ?? 0
+        enableFrameCallback = enable
+        frameSkip = max(0, skipFrame) // 确保 >= 0
+        result(enable)
+    }
+    
+    private func releasePixelBufferHandle(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        // iOS 上使用环形 buffer 池，buffer 会自动清理（FIFO + 超时）
+        // 但为了兼容 Android API，可以手动清理最旧的 buffer
+        bufferQueueLock.lock()
+        if !activeBuffers.isEmpty {
+            let oldBuffer = activeBuffers.removeFirst()
+            CVPixelBufferUnlockBaseAddress(oldBuffer, CVPixelBufferLockFlags.readOnly)
+            bufferTimestamps.removeValue(forKey: oldBuffer)
+            // Swift 会自动释放引用（当从数组中移除时）
+        }
+        bufferQueueLock.unlock()
+        result(true)
+    }
+    
+    // MARK: - Zoom Control
+    
+    private func getZoomRange(result: @escaping FlutterResult) {
+        guard let camera = currentCamera else {
+            result(FlutterError(code: "NOT_INITIALIZED", message: "相机未初始化", details: nil))
+            return
+        }
+        
+        let minZoom = CGFloat(1.0)
+        let maxZoom = camera.activeFormat.videoMaxZoomFactor
+        let currentZoom = camera.videoZoomFactor
+        
+        let zoomRange: [String: Any] = [
+            "minZoom": minZoom,
+            "maxZoom": maxZoom,
+            "currentZoom": currentZoom
+        ]
+        
+        result(zoomRange)
+    }
+    
+    private func setZoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any] else {
+            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Invalid arguments", details: nil))
+            return
+        }
+        
+        guard let zoom = args["zoom"] as? Double else {
+            result(FlutterError(code: "INVALID_ARGUMENT", message: "zoom 参数无效", details: nil))
+            return
+        }
+        
+        guard let camera = currentCamera else {
+            result(FlutterError(code: "NOT_INITIALIZED", message: "相机未初始化", details: nil))
+            return
+        }
+        
+        let minZoom = CGFloat(1.0)
+        let maxZoom = camera.activeFormat.videoMaxZoomFactor
+        let zoomValue = CGFloat(zoom).clamped(to: minZoom...maxZoom)
+        
+        do {
+            try camera.lockForConfiguration()
+            camera.videoZoomFactor = zoomValue
+            camera.unlockForConfiguration()
+            
+            print("[BbRtmpPlugin] Zoom set to: \(zoomValue) (range: \(minZoom) - \(maxZoom))")
+            result(true)
+        } catch {
+            print("[BbRtmpPlugin] Failed to set zoom: \(error)")
+            result(FlutterError(code: "SET_ZOOM_FAILED", message: "设置 zoom 失败: \(error.localizedDescription)", details: nil))
+        }
+    }
+    
+    /// 清理过期的 buffer（超时自动清理，防止内存泄漏）
+    private func cleanupExpiredBuffers() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        bufferQueueLock.lock()
+        let expiredBuffers = activeBuffers.filter { buffer in
+            if let timestamp = bufferTimestamps[buffer], now - timestamp > bufferMaxAgeMs {
+                return true
+            }
+            return false
+        }
+        for buffer in expiredBuffers {
+            CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags.readOnly)
+            if let index = activeBuffers.firstIndex(where: { $0 === buffer }) {
+                activeBuffers.remove(at: index)
+            }
+            bufferTimestamps.removeValue(forKey: buffer)
+        }
+        bufferQueueLock.unlock()
+    }
+}
+
+// MARK: - FlutterStreamHandler
+
+// MARK: - FlutterStreamHandler for frame EventChannel
+
+extension BbRtmpPlugin: FlutterStreamHandler {
+    public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        // 这个方法只处理 frame EventChannel
+        frameEventSink = events
+        enableFrameCallback = true
+        frameCounter = 0
+        fboLoopStartTime = 0 // 重置开始时间
+        return nil
+    }
+    
+    public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        frameEventSink = nil
+        enableFrameCallback = false
+        frameCounter = 0
+        fboLoopStartTime = 0
+        return nil
+    }
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -447,12 +794,131 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         // 2. Render into FBO (GPU work)
         guard let targetBuffer = renderToFbo(pixelBuffer) else { return }
         
-        // 3. Encode frame (Hardware Encoder work)
+        // 3. Send FBO RGBA data if callback is enabled
+        // 优化：只在需要时处理，减少性能开销
+        if enableFrameCallback && frameEventSink != nil {
+            // 初始化开始时间（第一次调用时）
+            if fboLoopStartTime == 0 {
+                fboLoopStartTime = Int64(Date().timeIntervalSince1970 * 1000)
+            }
+            
+            frameCounter += 1
+            let currentTime = Int64(Date().timeIntervalSince1970 * 1000)
+            let elapsedMs = currentTime - fboLoopStartTime
+            let pastWarmup = elapsedMs >= fboReadWarmupMs
+            
+            // 跳帧：根据 skipFrame 参数决定（0 表示不跳帧，每帧都回调）
+            // skipFrame = 0: 每帧都回调
+            // skipFrame = n: 每隔 n 帧回调一次（第 1, n+2, 2n+3... 帧）
+            let shouldReadForYolo = pastWarmup && (frameSkip == 0 || ((frameCounter - 1) % Int64(frameSkip + 1) == 0))
+            
+            if shouldReadForYolo {
+                // 异步发送，不阻塞当前线程
+                sendFboRgbaData(pixelBuffer: targetBuffer)
+            }
+        }
+        
+        // 4. Encode frame (Hardware Encoder work)
         videoEncoder?.encodeFrame(pixelBuffer: targetBuffer, presentationTimeUs: presentationTimeUs)
         
-        // 4. Update preview texture
+        // 5. Update preview texture
         DispatchQueue.main.async { [weak self] in
             self?.previewTexture?.updateBuffer(targetBuffer)
+        }
+    }
+    
+    private func sendFboRgbaData(pixelBuffer: CVPixelBuffer) {
+        // 零拷贝实现：直接使用传入的 buffer 地址
+        // 由于使用了 IOSurface，地址在 buffer 生命周期内稳定
+        // 通过保持 buffer 引用（环形池），防止被重用
+        
+        // 1. 清理过期的 buffer（超时自动清理）
+        cleanupExpiredBuffers()
+        
+        // 2. 保持 buffer 引用（防止被重用）
+        // Swift 中 CVPixelBuffer 是自动内存管理的，只需保持引用即可
+        bufferQueueLock.lock()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        bufferTimestamps[pixelBuffer] = now
+        
+        // 环形池：如果已满，移除最旧的 buffer（FIFO）
+        if activeBuffers.count >= maxActiveBuffers {
+            let oldBuffer = activeBuffers.removeFirst()
+            // 解锁并清理最旧的 buffer
+            CVPixelBufferUnlockBaseAddress(oldBuffer, CVPixelBufferLockFlags.readOnly)
+            bufferTimestamps.removeValue(forKey: oldBuffer)
+        }
+        activeBuffers.append(pixelBuffer)
+        bufferQueueLock.unlock()
+        
+        // 2. 锁定 buffer 并获取地址
+        let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, CVPixelBufferLockFlags.readOnly)
+        guard lockStatus == kCVReturnSuccess else {
+            print("[BbRtmpPlugin] 锁定 CVPixelBuffer 失败: \(lockStatus)")
+            bufferQueueLock.lock()
+            if let index = activeBuffers.firstIndex(where: { $0 === pixelBuffer }) {
+                activeBuffers.remove(at: index)
+            }
+            bufferTimestamps.removeValue(forKey: pixelBuffer)
+            bufferQueueLock.unlock()
+            return
+        }
+        
+        // 3. 获取地址（IOSurface 地址在 buffer 生命周期内稳定）
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, CVPixelBufferLockFlags.readOnly)
+            bufferQueueLock.lock()
+            if let index = activeBuffers.firstIndex(where: { $0 === pixelBuffer }) {
+                activeBuffers.remove(at: index)
+            }
+            bufferTimestamps.removeValue(forKey: pixelBuffer)
+            bufferQueueLock.unlock()
+            return
+        }
+        
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        
+        // 4. 转换地址（零拷贝：直接使用 IOSurface 地址）
+        let address = UInt64(bitPattern: Int64(Int(bitPattern: baseAddress)))
+        
+        // 5. 发送数据（保持 buffer 锁定和引用，直到不再需要）
+        // 注意：EventChannel 必须在主线程发送，否则会导致数据丢失或崩溃
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                // self 已释放，清理 buffer
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, CVPixelBufferLockFlags.readOnly)
+                return
+            }
+            
+            guard let sink = self.frameEventSink else {
+                // 如果发送失败，清理 buffer
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, CVPixelBufferLockFlags.readOnly)
+                self.bufferQueueLock.lock()
+                if let index = self.activeBuffers.firstIndex(where: { $0 === pixelBuffer }) {
+                    self.activeBuffers.remove(at: index)
+                }
+                self.bufferTimestamps.removeValue(forKey: pixelBuffer)
+                self.bufferQueueLock.unlock()
+                return
+            }
+            
+            // 在主线程发送数据（Flutter 要求）
+            let data: [String: Any] = [
+                "type": "fbo_rgba",
+                "address": address,
+                "width": width,
+                "height": height,
+                "stride": bytesPerRow
+            ]
+            
+            sink(data)
+            
+            // 注意：保持 buffer 锁定和引用（通过 activeBuffers 数组）
+            // buffer 会在队列满时自动清理（FIFO + 超时），或通过 releasePixelBufferHandle 手动释放
+            // 由于使用了 IOSurface，地址在 buffer 生命周期内保持稳定（零拷贝）
+            // Swift 会自动管理内存，当 activeBuffers 移除引用时，buffer 会被自动释放
         }
     }
     
@@ -510,5 +976,45 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         context.render(finalImage, to: outBuffer, bounds: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight), colorSpace: CGColorSpaceCreateDeviceRGB())
         
         return outBuffer
+    }
+}
+
+// MARK: - StatusStreamHandler for status EventChannel
+
+private class StatusStreamHandler: NSObject, FlutterStreamHandler {
+    weak var plugin: BbRtmpPlugin?
+    let isFrameChannel: Bool
+    
+    init(plugin: BbRtmpPlugin, isFrameChannel: Bool) {
+        self.plugin = plugin
+        self.isFrameChannel = isFrameChannel
+    }
+    
+    public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        if isFrameChannel {
+            // Frame channel - set event sink and enable callback
+            plugin?.setFrameEventSink(events)
+        } else {
+            // Status channel
+            plugin?.setStatusEventSink(events)
+        }
+        return nil
+    }
+    
+    public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        if isFrameChannel {
+            plugin?.setFrameEventSink(nil)
+        } else {
+            plugin?.setStatusEventSink(nil)
+        }
+        return nil
+    }
+}
+
+// MARK: - CGFloat Extension for Clamping
+
+extension CGFloat {
+    func clamped(to range: ClosedRange<CGFloat>) -> CGFloat {
+        return Swift.max(range.lowerBound, Swift.min(range.upperBound, self))
     }
 }

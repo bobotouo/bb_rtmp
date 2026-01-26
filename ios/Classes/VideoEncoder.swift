@@ -12,6 +12,11 @@ class VideoEncoder {
     private var isEncoding = false
     private var callback: EncoderCallback?
     
+    // Save SPS/PPS to notify callback when it's set later
+    private var savedSps: Data?
+    private var savedPps: Data?
+    private let spsPpsLock = NSLock()
+    
     // Frame counters for logging
     private var outputFrameCount = 0
     private var emptyFrameCount = 0
@@ -30,6 +35,14 @@ class VideoEncoder {
     
     func setCallback(_ callback: EncoderCallback) {
         self.callback = callback
+        
+        // If we already have saved SPS/PPS, notify immediately
+        spsPpsLock.lock()
+        if let sps = savedSps, let pps = savedPps {
+            print("[\(tag)] Found saved SPS/PPS when setting callback, notifying immediately: SPS size=\(sps.count), PPS size=\(pps.count)")
+            callback.onCodecConfig(sps: sps, pps: pps)
+        }
+        spsPpsLock.unlock()
     }
     
     /**
@@ -172,6 +185,11 @@ class VideoEncoder {
             compressionSession = nil
         }
         
+        spsPpsLock.lock()
+        savedSps = nil
+        savedPps = nil
+        spsPpsLock.unlock()
+        
         print("[\(tag)] Video encoder released")
     }
     
@@ -294,8 +312,25 @@ class VideoEncoder {
         let spsData = Data(bytes: sps, count: spsSize)
         let ppsData = Data(bytes: pps, count: ppsSize)
         
-        print("[\(tag)] Extracted SPS/PPS: SPS size=\(spsSize), PPS size=\(ppsSize)")
-        callback?.onCodecConfig(sps: spsData, pps: ppsData)
+        // Check if SPS/PPS has changed (avoid duplicate notifications)
+        spsPpsLock.lock()
+        let hasChanged = savedSps != spsData || savedPps != ppsData
+        
+        if hasChanged {
+            savedSps = spsData
+            savedPps = ppsData
+            print("[\(tag)] Extracted SPS/PPS: SPS size=\(spsSize), PPS size=\(ppsSize)")
+            
+            // Notify callback only if changed
+            if let callback = callback {
+                spsPpsLock.unlock()
+                callback.onCodecConfig(sps: spsData, pps: ppsData)
+            } else {
+                spsPpsLock.unlock()
+            }
+        } else {
+            spsPpsLock.unlock()
+        }
     }
     
     /**

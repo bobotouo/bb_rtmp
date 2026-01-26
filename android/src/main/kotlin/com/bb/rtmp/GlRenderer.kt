@@ -212,7 +212,10 @@ class GlRenderer {
      * @param extraRotation 额外的旋转角度（0, 90, 180, 270），用于横屏时旋转内容
      * @param isInputContentPortrait 输入内容是否为竖屏（用于计算宽高比）
      */
-    fun drawFrameToFbo(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int = 0, isInputContentPortrait: Boolean = false) {
+    /**
+     * @param readTarget 若需读像素：传入 capacity>=width*height*4 的 DirectByteBuffer，在渲染完成后、解绑 FBO 前立即读取
+     */
+    fun drawFrameToFbo(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int = 0, isInputContentPortrait: Boolean = false, readTarget: ByteBuffer? = null) {
         // 绑定到 FBO
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffer)
         GLES20.glViewport(0, 0, canvasWidth, canvasHeight)
@@ -291,6 +294,38 @@ class GlRenderer {
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(texCoordHandle)
         
+        // 在解绑 FBO 之前读取像素（渲染完成的最可靠时机）
+        val readSize = canvasWidth * canvasHeight * 4
+        if (readTarget != null && readTarget.capacity() >= readSize) {
+            readTarget.clear()
+            GLES20.glFinish()
+            GLES20.glReadPixels(0, 0, canvasWidth, canvasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readTarget)
+            
+            // 翻转数据：glReadPixels 读取的数据是上下翻转的（OpenGL 坐标系左下角为原点）
+            // 我们需要翻转，使其符合标准图像坐标系（左上角为原点）
+            val rowSize = canvasWidth * 4
+            val tempRow = ByteArray(rowSize)
+            val bufferArray = ByteArray(readSize)
+            readTarget.rewind()
+            readTarget.get(bufferArray)
+            
+            // 翻转行：从下往上读取，从上往下写入
+            for (y in 0 until canvasHeight / 2) {
+                val topRowIndex = y * rowSize
+                val bottomRowIndex = (canvasHeight - 1 - y) * rowSize
+                
+                // 交换两行
+                System.arraycopy(bufferArray, topRowIndex, tempRow, 0, rowSize)
+                System.arraycopy(bufferArray, bottomRowIndex, bufferArray, topRowIndex, rowSize)
+                System.arraycopy(tempRow, 0, bufferArray, bottomRowIndex, rowSize)
+            }
+            
+            // 将翻转后的数据写回 buffer
+            readTarget.clear()
+            readTarget.put(bufferArray)
+            readTarget.rewind()
+        }
+        
         // 解绑 FBO
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
@@ -340,23 +375,26 @@ class GlRenderer {
      * @param isInputContentPortrait 输入内容是否为竖屏
      * @param timestampNs 时间戳（纳秒）
      */
-    fun renderFrame(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int, isInputContentPortrait: Boolean, timestampNs: Long) {
-        // 1. 渲染到 FBO（只渲染一次，这是唯一的渲染操作）
-        drawFrameToFbo(cameraTexture, stMatrix, videoWidth, videoHeight, mode, extraRotation, isInputContentPortrait)
-        
+    /**
+     * @param fboReadTarget 若需读像素给 YOLO：传入 capacity>=width*height*4 的 DirectByteBuffer，
+     *                     在 drawFrameToFbo 内渲染完成后、解绑 FBO 前立即读取（最可靠）
+     */
+    fun renderFrame(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int, isInputContentPortrait: Boolean, timestampNs: Long, fboReadTarget: ByteBuffer? = null) {
+        // 1. 渲染到 FBO，并在渲染完成后立即读取像素（若需要）
+        drawFrameToFbo(cameraTexture, stMatrix, videoWidth, videoHeight, mode, extraRotation, isInputContentPortrait, fboReadTarget)
+
         // 2. 输出到编码器 Surface
         if (eglEncoderSurface != null) {
             drawFboToSurface()
             EGLExt.eglPresentationTimeANDROID(eglDisplay, eglEncoderSurface, timestampNs)
             EGL14.eglSwapBuffers(eglDisplay, eglEncoderSurface)
         }
-        
-        // 3. 输出到预览 Surface（将 FBO texture 渲染到 previewSurfaceTexture）
+
+        // 3. 输出到预览 Surface
         if (eglPreviewSurface != null) {
             EGL14.eglMakeCurrent(eglDisplay, eglPreviewSurface, eglPreviewSurface, eglContext)
             drawFboToSurface()
             EGL14.eglSwapBuffers(eglDisplay, eglPreviewSurface)
-            // 切换回编码器 Surface（下次渲染时使用）
             EGL14.eglMakeCurrent(eglDisplay, eglEncoderSurface, eglEncoderSurface, eglContext)
         }
     }
@@ -365,6 +403,72 @@ class GlRenderer {
      * 获取 FBO texture ID（用于预览渲染）
      */
     fun getFboTextureId(): Int = fboTextureId
+    
+    /**
+     * 从 FBO 读取 RGBA 像素数据（用于 YOLO 检测）
+     * 注意：必须在正确的 EGL context 中调用（即在 renderFrame 之后调用）
+     * @param targetBuffer 可选：复用该 DirectByteBuffer 写入，避免每帧分配、且保证在插件侧长期有效；需 capacity >= width*height*4
+     * @return ByteBuffer 包含 RGBA 数据，格式为 width * height * 4 字节；若使用 targetBuffer 则返回同一实例
+     * 注意：glReadPixels 读取的数据是上下翻转的（OpenGL 坐标系左下角为原点），
+     * 我们在这里翻转数据，使其返回正确方向的图像（标准图像坐标系，左上角为原点）
+     */
+    fun readFboRgba(targetBuffer: ByteBuffer? = null): ByteBuffer? {
+        if (fboFrameBuffer == 0 || canvasWidth <= 0 || canvasHeight <= 0) {
+            return null
+        }
+        val bufferSize = canvasWidth * canvasHeight * 4
+        val buffer = if (targetBuffer != null && targetBuffer.capacity() >= bufferSize) {
+            targetBuffer.clear()
+            targetBuffer.order(ByteOrder.nativeOrder())
+            targetBuffer
+        } else {
+            ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder())
+        }
+
+        // 确保绑定到 FBO（在 renderFrame 中，FBO 已经解绑，需要重新绑定）
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffer)
+        // 确保 GPU 已完成渲染到 FBO，再读取，避免读到未完成或全黑帧
+        GLES20.glFinish()
+
+        // 从 FBO 读取像素数据（RGBA 格式）
+        // 注意：glReadPixels 从当前绑定的 framebuffer 读取，坐标系是左下角为原点
+        GLES20.glReadPixels(0, 0, canvasWidth, canvasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            android.util.Log.e(TAG, "glReadPixels 错误: $error")
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            return null
+        }
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        
+        // 翻转数据：glReadPixels 读取的数据是上下翻转的（OpenGL 坐标系左下角为原点）
+        // 我们需要翻转，使其符合标准图像坐标系（左上角为原点）
+        val rowSize = canvasWidth * 4
+        val tempRow = ByteArray(rowSize)
+        val bufferArray = ByteArray(bufferSize)
+        buffer.rewind()
+        buffer.get(bufferArray)
+        
+        // 翻转行：从下往上读取，从上往下写入
+        for (y in 0 until canvasHeight / 2) {
+            val topRowIndex = y * rowSize
+            val bottomRowIndex = (canvasHeight - 1 - y) * rowSize
+            
+            // 交换两行
+            System.arraycopy(bufferArray, topRowIndex, tempRow, 0, rowSize)
+            System.arraycopy(bufferArray, bottomRowIndex, bufferArray, topRowIndex, rowSize)
+            System.arraycopy(tempRow, 0, bufferArray, bottomRowIndex, rowSize)
+        }
+        
+        // 将翻转后的数据写回 buffer
+        buffer.clear()
+        buffer.put(bufferArray)
+        buffer.rewind()
+        
+        return buffer
+    }
 
     private fun loadShader(type: Int, code: String): Int {
         val shader = GLES20.glCreateShader(type)

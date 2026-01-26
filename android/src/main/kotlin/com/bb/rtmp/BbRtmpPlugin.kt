@@ -2,11 +2,18 @@ package com.bb.rtmp
 
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
+import android.hardware.HardwareBuffer
+import android.media.Image
+import android.media.ImageReader
+import android.media.MediaCodec
+import com.bb.rtmp.NativeBridge
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
@@ -16,6 +23,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engine.plugins.activity.ActivityAware {
     private lateinit var channel: MethodChannel
@@ -55,14 +65,194 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
     private var glFboCanvasHeight: Int = 0
     private var glCameraWidth: Int = 0
     private var glCameraHeight: Int = 0
-    // FBO 渲染循环控制标志
+    // FBO 渲染循环控制
     private var isFboRenderLoopRunning = false
+    private var fboRenderJob: kotlinx.coroutines.Job? = null
+    // 时间戳管理（用于确保时间戳递增，避免编码器丢帧）
+    private var lastTimestampNs: Long = 0
+    
+    // NV12 帧数据句柄传递相关
+    private var frameEventChannel: EventChannel? = null
+    private var frameEventSink: EventChannel.EventSink? = null
+    
+    // 推流状态通知相关
+    private var statusEventChannel: EventChannel? = null
+    private var statusEventSink: EventChannel.EventSink? = null
+    private var enableFrameCallback: Boolean = false
+    private var frameSkip: Int = 0 // 跳帧数，0 表示不跳帧（每帧都回调）
+    private var imageReader: ImageReader? = null
+    private var imageReaderSurface: Surface? = null
+    // 句柄映射表：句柄ID -> HardwareBuffer
+    private val handleToBuffer = ConcurrentHashMap<Long, HardwareBuffer>()
+    // 句柄映射表：句柄ID -> Image（需要保存以便释放时关闭）
+    private val handleToImage = ConcurrentHashMap<Long, Image>()
+    // 句柄映射表：句柄ID -> AHardwareBuffer* 指针（零拷贝）
+    private val handleToNativePtr = ConcurrentHashMap<Long, Long>()
+    // 句柄计数器（从大于 Int 范围的值开始，确保通过 MethodChannel 传递为 Long）
+    private var handleCounter: Long = 1L shl 33
+    private val handleLock = Any()
+
+    // ImageReader 回调监听器
+    private val imageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
+        if (!this.enableFrameCallback || frameEventSink == null) {
+            // 如果回调未启用，直接关闭 Image
+            reader.acquireLatestImage()?.close()
+            return@OnImageAvailableListener
+        }
+        
+        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
+        
+        try {
+            // 检查 Android 版本，HardwareBuffer 需要 API 26+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                val hardwareBuffer = image.hardwareBuffer
+                if (hardwareBuffer != null) {
+                    // 如果缓存中的帧已接近 ImageReader 上限，直接丢弃本帧，避免占满导致崩溃
+                    val currentCached = handleToImage.size
+                    val maxImages = reader.maxImages.coerceAtLeast(4)
+                    if (currentCached >= maxImages - 1) {
+                        // 丢弃本帧，释放资源
+                        try {
+                            image.close()
+                        } catch (_: Exception) {}
+                        return@OnImageAvailableListener
+                    }
+
+                    // 生成唯一句柄，存入前做简单的淘汰，避免占满 maxImages
+                    val handle = synchronized(handleLock) {
+                        // 如果已接收的帧数接近 ImageReader 的上限，清理最旧的帧
+                        val limit = (reader.maxImages * 2).coerceAtLeast(4) // 保留一些冗余
+                        if (handleToImage.size >= limit) {
+                            // 移除最旧的一个
+                            val oldestKey = handleToImage.keys.minOrNull()
+                            if (oldestKey != null) {
+                                try {
+                                    handleToNativePtr.remove(oldestKey)?.let {
+                                        try { NativeBridge.unlockAHardwareBuffer(it) } catch (_: Exception) {}
+                                        try { NativeBridge.releaseAHardwareBufferPtr(it) } catch (_: Exception) {}
+                                    }
+                                    handleToBuffer.remove(oldestKey)?.close()
+                                    handleToImage.remove(oldestKey)?.close()
+                                } catch (_: Exception) {}
+                            }
+                        }
+
+                        handleCounter++
+                        handleToBuffer[handleCounter] = hardwareBuffer
+                        handleToImage[handleCounter] = image
+                        handleCounter
+                    }
+                    
+                    // 获取图像信息
+                    val width = image.width
+                    val height = image.height
+                    val timestamp = System.currentTimeMillis() * 1000 // 微秒
+                    val pixelFormat = image.format
+                    
+                    // 通过 EventChannel 发送句柄信息
+                    val eventData = mapOf(
+                        "type" to "nv12_handle",
+                        "handle" to handle,
+                        "width" to width,
+                        "height" to height,
+                        "timestamp" to timestamp,
+                        "pixelFormat" to pixelFormat
+                    )
+                    
+                    // 注意：Android 的 EventChannel.EventSink 必须在主线程调用（与 iOS 不同）
+                    // 但我们可以先切换到主线程，避免阻塞当前线程
+                    scope.launch(Dispatchers.Main) {
+                        frameEventSink?.success(eventData)
+                    }
+                } else {
+                    android.util.Log.w("BbRtmpPlugin", "Image 没有 HardwareBuffer（API < 26 或格式不支持）")
+                    image.close()
+                }
+            } else {
+                android.util.Log.w("BbRtmpPlugin", "HardwareBuffer 需要 Android 8.0+，当前版本: ${android.os.Build.VERSION.SDK_INT}")
+                image.close()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "处理 Image 失败", e)
+            // 确保异常情况下也释放 Image
+            try {
+                image.close()
+            } catch (closeException: Exception) {
+                android.util.Log.e("BbRtmpPlugin", "关闭 Image 失败", closeException)
+            }
+        }
+    }
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "com.bb.rtmp/plugin")
         channel.setMethodCallHandler(this)
         textureRegistry = flutterPluginBinding.textureRegistry
         context = flutterPluginBinding.applicationContext
+        
+        // 注册 EventChannel 用于传递帧数据句柄
+        frameEventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "com.bb.rtmp/frames")
+        frameEventChannel?.setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                frameEventSink = events
+                enableFrameCallback = true
+            }
+            
+            override fun onCancel(arguments: Any?) {
+                frameEventSink = null
+                enableFrameCallback = false
+                // 清理所有未释放的句柄
+                synchronized(handleLock) {
+                    // 先关闭所有 Image
+                    handleToImage.values.forEach { image ->
+                        try {
+                            image.close()
+                        } catch (e: Exception) {
+                            android.util.Log.w("BbRtmpPlugin", "关闭 Image 失败", e)
+                        }
+                    }
+                    handleToImage.clear()
+                    
+                    // 释放 AHardwareBuffer 指针（先解锁再释放）
+                    handleToNativePtr.values.forEach { ptr ->
+                        if (ptr != 0L) {
+                            try {
+                                NativeBridge.unlockAHardwareBuffer(ptr)
+                            } catch (e: Exception) {
+                                android.util.Log.w("BbRtmpPlugin", "解锁 AHardwareBuffer 失败", e)
+                            }
+                            try {
+                                NativeBridge.releaseAHardwareBufferPtr(ptr)
+                            } catch (e: Exception) {
+                                android.util.Log.w("BbRtmpPlugin", "释放 AHardwareBuffer 指针失败", e)
+                            }
+                        }
+                    }
+                    handleToNativePtr.clear()
+
+                    // 然后关闭所有 HardwareBuffer
+                    handleToBuffer.values.forEach { buffer ->
+                        try {
+                            buffer.close()
+                        } catch (e: Exception) {
+                            android.util.Log.w("BbRtmpPlugin", "释放 HardwareBuffer 失败", e)
+                        }
+                    }
+                    handleToBuffer.clear()
+                }
+            }
+        })
+        
+        // 注册 EventChannel 用于推流状态通知
+        statusEventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "com.bb.rtmp/status")
+        statusEventChannel?.setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                statusEventSink = events
+            }
+
+            override fun onCancel(arguments: Any?) {
+                statusEventSink = null
+            }
+        })
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -72,13 +262,18 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         when (call.method) {
+            "initializePreview" -> {
+                scope.launch {
+                    initializePreview(call, result)
+                }
+            }
             "initialize" -> {
                 scope.launch {
                     initialize(call, result)
                 }
             }
             "startStreaming" -> {
-                startStreaming(result)
+                startStreaming(call, result)
             }
             "stopStreaming" -> {
                 stopStreaming(result)
@@ -102,6 +297,28 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             }
             "getStatus" -> {
                 getStatus(result)
+            }
+            "enableFrameCallback" -> {
+                enableFrameCallback(call, result)
+            }
+            "releasePixelBufferHandle" -> {
+                releasePixelBufferHandle(call, result)
+            }
+            "getHardwareBufferNativeHandle" -> {
+                getHardwareBufferNativeHandle(call, result)
+            }
+            "getImagePlanes" -> {
+                getImagePlanes(call, result)
+            }
+            "getZoomRange" -> {
+                getZoomRange(result)
+            }
+            "setZoom" -> {
+                setZoom(call, result)
+            }
+            "stopPreview" -> {
+                stopPreview()
+                result.success(null)
             }
             else -> {
                 result.notImplemented()
@@ -177,10 +394,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             this.streamWidth = fboCanvasWidth
             this.streamHeight = fboCanvasHeight
             
-            android.util.Log.d("BbRtmpPlugin", "用户设置分辨率: ${userSetWidth}x${userSetHeight} (${if (isPortraitMode) "竖屏" else "横屏"})")
-            android.util.Log.d("BbRtmpPlugin", "FBO 画布分辨率（标准横屏）: ${fboCanvasWidth}x${fboCanvasHeight}")
-            android.util.Log.d("BbRtmpPlugin", "推流分辨率（标准横屏）: ${fboCanvasWidth}x${fboCanvasHeight}")
-            android.util.Log.d("BbRtmpPlugin", "相机纹理分辨率（硬件支持）: ${cameraWidth}x${cameraHeight}")
 
             // 5. 初始化编码器（使用标准横屏分辨率）
             videoEncoder = VideoEncoder()
@@ -197,17 +410,25 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             }
 
             this.rtmpUrl = rtmpUrl
-            rtmpStreamer = RtmpStreamer()
-            if (!rtmpStreamer!!.initialize(rtmpUrl, videoEncoder!!, audioEncoder)) {
-                result.error("RTMP_INIT_FAILED", "RTMP 初始化失败", null)
-                resultReplied = true
-                return
-            }
+            
+            // 只在 RTMP URL 不为空时初始化推流器
+            if (rtmpUrl.isNotEmpty()) {
+                rtmpStreamer = RtmpStreamer()
+                // 设置状态回调
+                rtmpStreamer!!.setStatusCallback(object : RtmpStreamer.StatusCallback {
+                    override fun onStatus(status: String, error: String?) {
+                        notifyStreamingStatus(status, error)
+                    }
+                })
+                if (!rtmpStreamer!!.initialize(rtmpUrl, videoEncoder!!, audioEncoder)) {
+                    result.error("RTMP_INIT_FAILED", "RTMP 初始化失败", null)
+                    resultReplied = true
+                    return
+                }
 
-            // 6. 设置 RTMP 元数据（使用标准横屏分辨率，即编码器实际输出的分辨率）
-            // 关键：元数据的分辨率必须匹配编码器输出的实际分辨率
-            android.util.Log.d("BbRtmpPlugin", "设置 RTMP 元数据: ${fboCanvasWidth}x${fboCanvasHeight} (标准横屏分辨率，即编码器实际输出)")
-            rtmpStreamer!!.setMetadata(fboCanvasWidth, fboCanvasHeight, bitrate, fps, 44100, 1)
+                // 设置 RTMP 元数据（使用标准横屏分辨率，即编码器实际输出的分辨率）
+                rtmpStreamer!!.setMetadata(fboCanvasWidth, fboCanvasHeight, bitrate, fps, 44100, 1)
+            }
 
             // 7. 初始化 OpenGL 渲染器（延迟到渲染线程中初始化）
             // 在这里只创建 GlRenderer 对象，EGL 初始化在渲染线程中进行
@@ -220,10 +441,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             this.glCameraWidth = cameraWidth
             this.glCameraHeight = cameraHeight
             
-            android.util.Log.d("BbRtmpPlugin", "OpenGL 渲染器对象创建成功，将在渲染线程中初始化 EGL")
-            android.util.Log.d("BbRtmpPlugin", "  FBO 画布: ${fboCanvasWidth}x${fboCanvasHeight} (标准横屏分辨率)")
-            android.util.Log.d("BbRtmpPlugin", "  用户设置: ${userSetWidth}x${userSetHeight} (${if (isPortraitMode) "竖屏" else "横屏"})")
-            android.util.Log.d("BbRtmpPlugin", "  相机纹理: ${cameraWidth}x${cameraHeight} (硬件支持)")
 
             // 7. 准备预览纹理（使用 FBO 画布分辨率，因为预览显示的是 FBO 输出）
             // Flutter 的 Texture 的 SurfaceTexture 将作为 FBO 的预览输出 Surface
@@ -240,27 +457,31 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             fboInputSurfaceTexture = SurfaceTexture(false) // false 表示不在构造函数中创建纹理
             fboInputSurfaceTexture!!.setDefaultBufferSize(cameraWidth, cameraHeight)
             
-            // 如果需要 FBO 旋转，创建摄像头纹理
-            // 注意：纹理创建需要在 EGL 上下文创建之后，所以这里先不创建
-            // 在 onCameraOpened 回调中创建
-
-            // 8. 配置相机回调并打开
+            // 8. 创建 ImageReader 用于获取 NV12 帧数据（零拷贝）
+            // 使用 YUV_420_888 格式，这是相机最常用的格式，包含 NV12/NV21 数据
+            // 增加 maxImages 到 4，避免 AI 处理慢时占满缓冲区
+            imageReader = ImageReader.newInstance(cameraWidth, cameraHeight, ImageFormat.YUV_420_888, 4)
+            imageReader?.setOnImageAvailableListener(imageAvailableListener, null)
+            imageReaderSurface = imageReader?.surface
+            
+            // 9. 配置相机回调并打开
             cameraController!!.setStateCallback(object : CameraController.CameraStateCallback {
                 override fun onCameraOpened() {
                     scope.launch(Dispatchers.Main) {
-                        // 创建捕获会话
-                        // 始终使用 FBO：摄像头输出到预览 SurfaceTexture（Flutter 显示）和 FBO SurfaceTexture（推流）
-                        // 注意：预览 SurfaceTexture 会通过 CameraController.openCamera 自动添加到捕获会话
-                        
                         // 如果 FBO 未初始化（比如切换摄像头后），重新初始化
                         if (glRenderer == null || fboInputSurfaceTexture == null || previewSurfaceTexture == null) {
-                            android.util.Log.d("BbRtmpPlugin", "FBO 未初始化，重新初始化")
+                            // 重要：只有在 fboInputSurfaceTexture 为 null 时才创建新的
+                            // 如果是 switchCamera 后，fboInputSurfaceTexture 已经在 switchCamera 中创建并传给相机了
+                            // 这里不应该重新创建，否则会导致相机输出到旧的 SurfaceTexture，而渲染循环绑定新的
+                            if (fboInputSurfaceTexture == null) {
+                                fboInputSurfaceTexture = SurfaceTexture(false)
+                                fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
+                            } else {
+                                // 如果已经存在，确保大小正确
+                                fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
+                            }
                             
-                            // 重新创建 FBO 输入 SurfaceTexture
-                            fboInputSurfaceTexture = SurfaceTexture(false)
-                            fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
-                            
-                            // 重新设置预览 SurfaceTexture 大小（使用 Flutter Texture 的 SurfaceTexture）
+                            // 重新设置预览 SurfaceTexture 大小
                             val flutterTexture = textureEntry?.surfaceTexture()
                             if (flutterTexture != null) {
                                 flutterTexture.setDefaultBufferSize(glFboCanvasWidth, glFboCanvasHeight)
@@ -268,17 +489,20 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                             }
                             
                             // 重新创建 GlRenderer
+                            glRenderer?.release()
                             glRenderer = GlRenderer()
+                            cameraTextureId = 0
+                            
+                            // 重要：在 onCameraOpened 回调中，不要重置时间戳！
+                            // 因为：
+                            // 1. 如果是首次初始化，lastTimestampNs 已经是 0，不需要重置
+                            // 2. 如果是切换摄像头后，switchCamera 已经保持了时间戳连续，这里不应该重置
+                            // 只有在首次调用 initialize 时，lastTimestampNs 才会是 0
                         }
                         
                         if (glRenderer != null && fboInputSurfaceTexture != null && previewSurfaceTexture != null) {
-                            // 启动 FBO 渲染循环（在渲染线程中完成所有 EGL/OpenGL 操作）
-                            // 包括：初始化 EGL、初始化 OpenGL、创建纹理、绑定 SurfaceTexture、创建 Surface、添加到捕获会话
                             val encoderSurface = glEncoderSurface
                             if (encoderSurface != null) {
-                                // 将预览 SurfaceTexture 绑定到 Flutter Texture
-                                flutterPreviewTexture.setDefaultBufferSize(glFboCanvasWidth, glFboCanvasHeight)
-                                
                                 startFboRenderLoop(
                                     fboInputSurfaceTexture!!,
                                     previewSurfaceTexture!!,
@@ -290,12 +514,15 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                                 )
                             } else {
                                 android.util.Log.e("BbRtmpPlugin", "编码器 Surface 未初始化，无法启动渲染循环")
-                                cameraController?.createCaptureSession(videoEncoder?.getInputSurface())
+                                val surfaces = mutableListOf<Surface>()
+                                imageReaderSurface?.let { surfaces.add(it) }
+                                cameraController?.createCaptureSession(surfaces)
                             }
                         } else {
-                            // FBO 初始化失败，回退到直接输出（不应该发生）
                             android.util.Log.e("BbRtmpPlugin", "FBO 未初始化，无法创建捕获会话")
-                            cameraController?.createCaptureSession(videoEncoder?.getInputSurface())
+                            val surfaces = mutableListOf<Surface>()
+                            imageReaderSurface?.let { surfaces.add(it) }
+                            cameraController?.createCaptureSession(surfaces)
                         }
                         
                         if (!resultReplied) {
@@ -313,12 +540,13 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                 }
             })
 
-            bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, cameraController!!)
-            bitrateController!!.initialize(bitrate, fboCanvasWidth, fboCanvasHeight)
+            // 只在 RTMP 推流器已初始化时创建码率控制器
+            if (rtmpStreamer != null) {
+                bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, cameraController!!)
+                bitrateController!!.initialize(bitrate, fboCanvasWidth, fboCanvasHeight)
+            }
 
-            // 9. 打开相机（使用硬件支持的分辨率）
-            // 相机只输出到 FBO 输入 SurfaceTexture（用于 FBO 渲染）
-            // FBO 渲染后输出到编码器（推流）和预览 SurfaceTexture（Flutter 显示）
+            // 9. 打开相机
             cameraController!!.openCamera(cameraWidth, cameraHeight, fboInputSurfaceTexture!!)
 
         } catch (e: Exception) {
@@ -329,40 +557,190 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         }
     }
 
-    private fun startStreaming(result: Result) {
+    /**
+     * 仅初始化预览（不包含推流配置）
+     * 
+     * 这个方法只初始化相机和预览，推流配置在 startStreaming 时进行
+     */
+    private suspend fun initializePreview(call: MethodCall, result: Result) {
+        // 创建一个包含预览参数的 Map，然后用 MethodCall 构造函数
+        val previewArgs = mapOf(
+            "rtmpUrl" to "",  // 空 URL，跳过 RTMP 初始化
+            "width" to (call.argument<Int>("width") ?: 1920),
+            "height" to (call.argument<Int>("height") ?: 1080),
+            "bitrate" to 2000000,  // 默认码率（预览时不重要）
+            "fps" to (call.argument<Int>("fps") ?: 30),
+            "enableAudio" to false,  // 预览时不需要音频
+            "isPortrait" to (call.argument<Boolean>("isPortrait") ?: false),
+            "initialCameraFacing" to (call.argument<String>("initialCameraFacing") ?: "front")
+        )
+        val previewCall = MethodCall("initializePreview", previewArgs)
+        
+        initialize(previewCall, result)
+    }
+
+    private fun startStreaming(call: MethodCall, result: Result) {
         try {
-            rtmpStreamer?.start()
-            bitrateController?.start()
-            
-            // Start Foreground Service for background stability
-            context?.let { ctx ->
-                val intent = android.content.Intent(ctx, RtmpService::class.java)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    ctx.startForegroundService(intent)
-                } else {
-                    ctx.startService(intent)
-                }
+            // 检查是否已初始化预览
+            if (glRenderer == null || cameraController == null || videoEncoder == null) {
+                result.error("NOT_INITIALIZED", "请先调用 initialize 或 initializePreview", null)
+                return
             }
             
+            // 获取参数
+            val newRtmpUrl = call.argument<String>("rtmpUrl")
+            val newBitrate = call.argument<Int>("bitrate") ?: 2000000
+            val enableAudio = call.argument<Boolean>("enableAudio") ?: true
+            
+            // 更新 RTMP URL
+            if (newRtmpUrl != null && newRtmpUrl.isNotEmpty()) {
+                this.rtmpUrl = newRtmpUrl
+            }
+            
+            // 检查 RTMP URL
+            if (rtmpUrl.isEmpty()) {
+                result.error("NO_RTMP_URL", "未设置 RTMP 推流地址", null)
+                return
+            }
+            
+            // 立即返回，不等待连接完成
             result.success(null)
+            
+            // 发送连接中状态
+            notifyStreamingStatus("connecting", null)
+            
+            // 在后台线程中初始化 RTMP 连接
+            scope.launch(Dispatchers.IO) {
+                try {
+                    // 如果 RTMP 推流器未初始化，现在初始化
+                    if (rtmpStreamer == null) {
+                        // 初始化音频编码器（如果需要）
+                        if (enableAudio && audioEncoder == null) {
+                            audioEncoder = AudioEncoder()
+                            audioEncoder!!.initialize()
+                        }
+                        
+                        rtmpStreamer = RtmpStreamer()
+                        // 设置状态回调
+                        rtmpStreamer!!.setStatusCallback(object : RtmpStreamer.StatusCallback {
+                            override fun onStatus(status: String, error: String?) {
+                                notifyStreamingStatus(status, error)
+                            }
+                        })
+                        if (!rtmpStreamer!!.initialize(rtmpUrl, videoEncoder!!, audioEncoder)) {
+                            notifyStreamingStatus("failed", "RTMP 连接失败，请检查网络和推流地址")
+                            rtmpStreamer = null
+                            return@launch
+                        }
+                        
+                        // 设置 RTMP 元数据
+                        rtmpStreamer!!.setMetadata(glFboCanvasWidth, glFboCanvasHeight, newBitrate, 30, 44100, 1)
+                        
+                        // 初始化码率控制器
+                        bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, cameraController!!)
+                        bitrateController!!.initialize(newBitrate, glFboCanvasWidth, glFboCanvasHeight)
+                    } else {
+                        // RTMP 已初始化，直接使用现有配置
+                    }
+                    
+                    // 更新码率（通过码率控制器）
+                    if (newBitrate > 0) {
+                        bitrateController?.setBitrate(newBitrate)
+                    }
+                    
+                    rtmpStreamer?.start()
+                    bitrateController?.start()
+                    
+                    context?.let { ctx ->
+                        val intent = android.content.Intent(ctx, RtmpService::class.java)
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                            ctx.startForegroundService(intent)
+                        } else {
+                            ctx.startService(intent)
+                        }
+                    }
+                    
+                    // 发送连接成功状态
+                    notifyStreamingStatus("connected", null)
+                } catch (e: Exception) {
+                    android.util.Log.e("BbRtmpPlugin", "后台初始化 RTMP 失败", e)
+                    notifyStreamingStatus("failed", "开始推流失败: ${e.message}")
+                }
+            }
         } catch (e: Exception) {
             result.error("START_STREAMING_ERROR", "开始推流失败: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 通知推流状态变化
+     */
+    private fun notifyStreamingStatus(status: String, error: String?) {
+        val sink = statusEventSink ?: return
+        try {
+            val statusMap = mutableMapOf<String, Any>(
+                "status" to status
+            )
+            if (error != null) {
+                statusMap["error"] = error
+            }
+            // EventChannel 必须在主线程调用
+            scope.launch(Dispatchers.Main) {
+                sink.success(statusMap)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "发送状态通知失败", e)
+        }
+    }
+
+    private fun stopPreview() {
+        android.util.Log.i("BbRtmpPlugin", "stopPreview")
+        try {
+            // 1. 停止 FBO 渲染循环
+            stopFboRenderLoop()
+            
+            // 2. 停止相机
+            cameraController?.closeCamera()
+            
+            // 3. 释放预览纹理
+            textureEntry?.release()
+            textureEntry = null
+            previewSurfaceTexture = null
+            
+            // 4. 下面的资源在 release 时也会处理，但 stopPreview 应该优先清理预览相关的
+            fboInputSurfaceTexture?.release()
+            fboInputSurfaceTexture = null
+            
+            imageReaderSurface?.release()
+            imageReaderSurface = null
+            imageReader?.close()
+            imageReader = null
+            
+            glRenderer?.release()
+            glRenderer = null
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "stopPreview failed", e)
         }
     }
 
     private fun stopStreaming(result: Result) {
         try {
+            // 1. 先停止推流和码率控制
             rtmpStreamer?.stop()
             bitrateController?.stop()
             
-            // Stop Foreground Service
+            // 2. 停止服务
             context?.let { ctx ->
                 val intent = android.content.Intent(ctx, RtmpService::class.java)
                 ctx.stopService(intent)
             }
             
+            // 发送停止状态
+            notifyStreamingStatus("stopped", null)
+            
             result.success(null)
         } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "停止推流失败", e)
             result.error("STOP_STREAMING_ERROR", "停止推流失败: ${e.message}", null)
         }
     }
@@ -374,41 +752,54 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                 return
             }
 
-            val size = controller.getPreviewSize() ?: run {
-                result.error("NO_PREVIEW_SIZE", "无预览尺寸", null)
-                return
-            }
-
-            val texture = textureEntry?.surfaceTexture() ?: run {
-                result.error("NO_TEXTURE", "无纹理", null)
-                return
-            }
-
-            // 停止 FBO 渲染循环（只设置标志，让渲染循环自己清理资源）
-            android.util.Log.d("BbRtmpPlugin", "停止 FBO 渲染循环（切换摄像头前）")
+            // 停止 FBO 渲染循环
             isFboRenderLoopRunning = false
+            fboRenderJob?.join()
+            fboRenderJob = null
             
-            // 等待渲染循环清理完成（增加等待时间，确保资源完全释放）
-            kotlinx.coroutines.delay(500)
+            // 重要：切换摄像头时不要重置时间戳！
+            // 因为编码器（MediaCodec）实例没有重新创建，它的 PTS 必须保持连续递增。
+            // 如果重置为 0，编码器会因为时间戳倒退而丢弃所有后续帧，导致黑屏。
 
-            // 创建新的 FBO 输入 SurfaceTexture
-            // 注意：必须在主线程创建，且在 openCamera 之前
+            // 释放旧的 ImageReader
+            imageReaderSurface?.release()
+            imageReaderSurface = null
+            imageReader?.close()
+            imageReader = null
+
+            val oldSurfaceTexture = fboInputSurfaceTexture
+            fboInputSurfaceTexture = null
+            
+            if (glRenderer != null) {
+                glRenderer = null
+            }
+            cameraTextureId = 0
+            
+            oldSurfaceTexture?.release()
+
             fboInputSurfaceTexture = SurfaceTexture(false)
             
-            // 使用用户设置的分辨率进行切换（CameraController 会自动选择最佳硬件分辨率）
-            // 注意：传入 fboInputSurfaceTexture 而不是 Flutter 的 texture
+            // 使用当前已知的分辨率预设大小（会在相机打开后更新）
+            val tempWidth = if (glCameraWidth > 0) glCameraWidth else userSetWidth
+            val tempHeight = if (glCameraHeight > 0) glCameraHeight else userSetHeight
+            fboInputSurfaceTexture!!.setDefaultBufferSize(tempWidth, tempHeight)
+            
+            imageReader = ImageReader.newInstance(tempWidth, tempHeight, ImageFormat.YUV_420_888, 4)
+            imageReader?.setOnImageAvailableListener(imageAvailableListener, null)
+            imageReaderSurface = imageReader?.surface
+            
             val success = controller.switchCamera(userSetWidth, userSetHeight, fboInputSurfaceTexture!!)
             
             if (success) {
-                // 切换成功，获取新的相机实际分辨率并更新
                 val newSize = controller.getPreviewSize()
                 if (newSize != null) {
                     this.cameraOutputWidth = newSize.width
                     this.cameraOutputHeight = newSize.height
-                    android.util.Log.d("BbRtmpPlugin", "切换摄像头后，相机实际输出分辨率: ${newSize.width}x${newSize.height}")
+                    // 关键：同步更新渲染所需的相机分辨率，确保渲染循环使用正确的尺寸
+                    this.glCameraWidth = newSize.width
+                    this.glCameraHeight = newSize.height
                 }
-                // CaptureSession 会在 onCameraOpened 回调中自动创建
-                // 在 onCameraOpened 回调中会重新初始化 FBO
+                videoEncoder?.requestKeyFrame()
                 result.success(null)
             } else {
                 result.error("SWITCH_CAMERA_FAILED", "切换摄像头失败", null)
@@ -417,86 +808,823 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             result.error("SWITCH_CAMERA_ERROR", "切换摄像头异常: ${e.message}", null)
         }
     }
-    
-    /**
-     * 停止 FBO 渲染循环并释放资源
-     * 注意：这个方法只设置标志，实际的资源释放由渲染循环在 EGL 上下文中完成
-     */
+
+    private suspend fun changeResolution(call: MethodCall, result: Result) {
+        try {
+            val targetWidth = call.argument<Int>("width") ?: 1920
+            val targetHeight = call.argument<Int>("height") ?: 1080
+
+            val controller = cameraController ?: run {
+                result.error("NOT_INITIALIZED", "未初始化", null)
+                return
+            }
+
+            val texture = textureEntry?.surfaceTexture() ?: run {
+                result.error("NO_TEXTURE", "无纹理", null)
+                return
+            }
+
+            val isPortrait = targetWidth < targetHeight
+            this.isPortraitMode = isPortrait
+            this.userSetWidth = targetWidth
+            this.userSetHeight = targetHeight
+            
+            val fboCanvasWidth = kotlin.math.max(targetWidth, targetHeight)
+            val fboCanvasHeight = kotlin.math.min(targetWidth, targetHeight)
+            
+            this.streamWidth = fboCanvasWidth
+            this.streamHeight = fboCanvasHeight
+
+            rtmpStreamer?.stop()
+            bitrateController?.stop()
+
+            isFboRenderLoopRunning = false
+            fboRenderJob?.join()
+            fboRenderJob = null
+            
+            lastTimestampNs = 0
+
+            scope.launch(Dispatchers.Main) {
+                try {
+                    controller.closeCamera()
+                    
+                    videoEncoder?.release()
+                    audioEncoder?.release()
+                    
+                    imageReaderSurface?.release()
+                    imageReaderSurface = null
+                    imageReader?.close()
+                    imageReader = null
+
+                    val bitrate = bitrateController?.getCurrentBitrate() ?: 2000000
+                    videoEncoder = VideoEncoder()
+                    val encoderSurface = videoEncoder!!.initialize(fboCanvasWidth, fboCanvasHeight, bitrate, 30)
+                    if (encoderSurface == null) {
+                        result.error("ENCODER_INIT_FAILED", "视频编码器初始化失败", null)
+                        return@launch
+                    }
+
+                    audioEncoder?.let {
+                        val audio = AudioEncoder()
+                        if (audio.initialize()) {
+                            audioEncoder = audio
+                        }
+                    }
+
+                    rtmpStreamer?.release()
+                    rtmpStreamer = RtmpStreamer()
+                    // 设置状态回调
+                    rtmpStreamer!!.setStatusCallback(object : RtmpStreamer.StatusCallback {
+                        override fun onStatus(status: String, error: String?) {
+                            notifyStreamingStatus(status, error)
+                        }
+                    })
+                    if (!rtmpStreamer!!.initialize(rtmpUrl, videoEncoder!!, audioEncoder)) {
+                        result.error("RTMP_INIT_FAILED", "RTMP 重新初始化失败", null)
+                        return@launch
+                    }
+
+                    val audioSampleRate = audioEncoder?.getSampleRate() ?: 44100
+                    val audioChannels = audioEncoder?.getChannelCount() ?: 1
+                    rtmpStreamer!!.setMetadata(fboCanvasWidth, fboCanvasHeight, bitrate, 30, audioSampleRate, audioChannels)
+
+                    bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, controller)
+                    bitrateController!!.initialize(bitrate, fboCanvasWidth, fboCanvasHeight)
+
+                    texture.setDefaultBufferSize(fboCanvasWidth, fboCanvasHeight)
+                    
+                    this@BbRtmpPlugin.glFboCanvasWidth = fboCanvasWidth
+                    this@BbRtmpPlugin.glFboCanvasHeight = fboCanvasHeight
+                    this@BbRtmpPlugin.glEncoderSurface = encoderSurface
+                    
+                    imageReader = ImageReader.newInstance(targetWidth, targetHeight, ImageFormat.YUV_420_888, 4)
+                    imageReader?.setOnImageAvailableListener(imageAvailableListener, null)
+                    imageReaderSurface = imageReader?.surface
+
+                    fboInputSurfaceTexture = SurfaceTexture(false)
+                    fboInputSurfaceTexture!!.setDefaultBufferSize(targetWidth, targetHeight)
+                    
+                    controller.setStateCallback(object : CameraController.CameraStateCallback {
+                        override fun onCameraOpened() {
+                            scope.launch(Dispatchers.Main) {
+                                val actualSize = controller.getPreviewSize()
+                                if (actualSize != null) {
+                                    this@BbRtmpPlugin.cameraOutputWidth = actualSize.width
+                                    this@BbRtmpPlugin.cameraOutputHeight = actualSize.height
+                                }
+                                val surfaces = mutableListOf<Surface>()
+                                imageReaderSurface?.let { surfaces.add(it) }
+                                controller.createCaptureSession(surfaces)
+                                result.success(null)
+                            }
+                        }
+
+                        override fun onCameraError(error: String) {
+                            result.error("CAMERA_ERROR", "切换分辨率时相机错误: $error", null)
+                        }
+                    })
+
+                    val success = controller.openCamera(targetWidth, targetHeight, fboInputSurfaceTexture!!)
+                    if (!success) {
+                        result.error("CHANGE_RESOLUTION_FAILED", "打开相机失败", null)
+                    }
+                } catch (e: Exception) {
+                    result.error("CHANGE_RESOLUTION_ERROR", "切换分辨率异常: ${e.message}", null)
+                }
+            }
+        } catch (e: Exception) {
+            result.error("CHANGE_RESOLUTION_ERROR", "切换分辨率异常: ${e.message}", null)
+        }
+    }
+
+    private fun setBitrate(call: MethodCall, result: Result) {
+        try {
+            val bitrate = call.argument<Int>("bitrate") ?: 2000000
+            bitrateController?.setBitrate(bitrate)
+            result.success(null)
+        } catch (e: Exception) {
+            result.error("SET_BITRATE_ERROR", "设置码率失败: ${e.message}", null)
+        }
+    }
+
+    private fun getStatus(result: Result) {
+        try {
+            val isStreaming = rtmpStreamer?.isStreaming() ?: false
+            val currentBitrate = bitrateController?.getCurrentBitrate() ?: 0
+            val cameraId = cameraController?.getCurrentCameraId()
+            
+            val status = mapOf(
+                "isStreaming" to isStreaming,
+                "currentBitrate" to currentBitrate,
+                "fps" to 30.0,
+                "width" to streamWidth,
+                "height" to streamHeight,
+                "previewWidth" to streamWidth,
+                "previewHeight" to streamHeight,
+                "cameraId" to (cameraId ?: "")
+            )
+
+            result.success(status)
+        } catch (e: Exception) {
+            result.error("GET_STATUS_ERROR", "获取状态失败: ${e.message}", null)
+        }
+    }
+
     private fun stopFboRenderLoop() {
-        android.util.Log.d("BbRtmpPlugin", "停止 FBO 渲染循环")
         isFboRenderLoopRunning = false
         
-        // 注意：实际的资源释放由渲染循环在 EGL 上下文中完成
-        // fboInputSurfaceTexture 由 CameraController 管理，不需要手动释放
-        // previewSurfaceTexture 是 Flutter Texture 的 SurfaceTexture，由 Flutter 管理，不需要手动释放
-        // 这里只清空引用，实际的释放由各自的拥有者完成
-        fboInputSurfaceTexture = null
-        previewSurfaceTexture = null
+        // 等待渲染循环真正结束
+        try {
+            // 使用 runBlocking 等待协程完成（在 release 时调用，可以阻塞）
+            kotlinx.coroutines.runBlocking {
+                fboRenderJob?.join()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "等待 FBO 渲染循环结束失败", e)
+        }
+        fboRenderJob = null
         
-        // GlRenderer 和纹理的释放由渲染循环完成
-        android.util.Log.d("BbRtmpPlugin", "FBO 渲染循环停止标志已设置")
+        // 注意：rgbaBufferPool 在函数作用域内，函数结束后会自动释放
+        // DirectByteBuffer 会被 GC 自动回收，无需手动释放
+    }
+
+    private fun startFboRenderLoop(
+        inputSurfaceTexture: SurfaceTexture,
+        previewSurfaceTexture: SurfaceTexture,
+        encoderSurface: Surface,
+        canvasWidth: Int,
+        canvasHeight: Int,
+        cameraWidth: Int,
+        cameraHeight: Int
+    ) {
+        if (isFboRenderLoopRunning) return
+        isFboRenderLoopRunning = true
+
+        fboRenderJob = scope.launch(Dispatchers.Default) {
+            val renderer = glRenderer ?: return@launch
+            
+            var previewSurface: Surface? = null
+            try {
+                previewSurface = Surface(previewSurfaceTexture)
+                renderer.initEgl(encoderSurface, previewSurface)
+                renderer.initGl(canvasWidth, canvasHeight)
+                
+                val textures = IntArray(1)
+                android.opengl.GLES20.glGenTextures(1, textures, 0)
+                cameraTextureId = textures[0]
+                
+                android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MIN_FILTER, android.opengl.GLES20.GL_LINEAR)
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MAG_FILTER, android.opengl.GLES20.GL_LINEAR)
+                android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+                
+                inputSurfaceTexture.attachToGLContext(cameraTextureId)
+                
+                scope.launch(Dispatchers.Main) {
+                    val surfaces = mutableListOf<Surface>()
+                    imageReaderSurface?.let { surfaces.add(it) }
+                    cameraController?.createCaptureSession(surfaces)
+                }
+                
+                var frameCount = 0L
+                var lastLogTime = System.currentTimeMillis()
+                val fboLoopStartMs = System.currentTimeMillis()
+                // 延迟 N 秒后再读像素/发 fbo_rgba，避免相机与 Surface 未稳定时读到全黑
+                val fboReadWarmupMs = 1000L
+                var fboReadWarmupLogged = false
+                var fboWarmupStartLogged = false
+                // 使用固定大小的环形 buffer pool（4 个），控制内存占用
+                // 每个 buffer 大小：canvasWidth * canvasHeight * 4 字节
+                // 4 个 buffer 足够覆盖异步延迟：渲染线程→主线程→YOLO后台线程
+                val rgbaBufferPoolSize = 4 // 固定大小，减少内存占用（从 16 减少到 4）
+                val rgbaBufferPool = Array(rgbaBufferPoolSize) {
+                    ByteBuffer.allocateDirect(canvasWidth * canvasHeight * 4).order(ByteOrder.nativeOrder())
+                }
+                var rgbaPoolIndex = 0 // 环形索引
+                // 跳帧调用 YOLO（根据 skipFrame 参数决定，0 表示不跳帧）
+                var yoloFrameCounter = 0
+                // 异常处理和重试机制（在循环外定义，保持状态）
+                var updateTexImageErrorCount = 0
+                val maxUpdateTexImageErrors = 10
+
+                while (isFboRenderLoopRunning && glRenderer != null && cameraTextureId != 0) {
+                    try {
+                        val frameStartTime = System.currentTimeMillis()
+                        
+                        if (inputSurfaceTexture.isReleased) {
+                            android.util.Log.w("BbRtmpPlugin", "SurfaceTexture 已被释放，停止渲染循环")
+                            break
+                        }
+                        
+                        // 异常处理和重试机制
+                        try {
+                            inputSurfaceTexture.updateTexImage()
+                            updateTexImageErrorCount = 0 // 重置错误计数
+                        } catch (e: Exception) {
+                            updateTexImageErrorCount++
+                            if (e.message?.contains("abandoned") == true || e.message?.contains("released") == true) {
+                                android.util.Log.w("BbRtmpPlugin", "updateTexImage 失败，SurfaceTexture 已废弃: ${e.message}")
+                                break
+                            }
+                            // 连续错误过多，停止渲染循环
+                            if (updateTexImageErrorCount >= maxUpdateTexImageErrors) {
+                                android.util.Log.e("BbRtmpPlugin", "updateTexImage 连续失败 $updateTexImageErrorCount 次，停止渲染循环")
+                                break
+                            }
+                            // 短暂等待后重试
+                            Thread.sleep(10)
+                            continue
+                        }
+                        
+                        if (isInBackground) {
+                            Thread.sleep(33)
+                            continue
+                        }
+                        
+                        val timestampNs = inputSurfaceTexture.timestamp
+                        
+                        // 调试：检查时间戳是否有效
+                        if (frameCount == 0L && timestampNs == 0L) {
+                            android.util.Log.w("BbRtmpPlugin", "警告：第一帧时间戳为 0，可能相机还没有开始输出")
+                        }
+                        val finalTimestampNs = synchronized(this@BbRtmpPlugin) {
+                            if (timestampNs <= lastTimestampNs) {
+                                lastTimestampNs + 33_333_333L
+                            } else {
+                                timestampNs
+                            }.also { lastTimestampNs = it }
+                        }
+                        
+                        val transformMatrix = FloatArray(16)
+                        inputSurfaceTexture.getTransformMatrix(transformMatrix)
+                        
+                        val controller = cameraController
+                        var rotation = 0
+                        var isInputContentPortrait = false
+                        
+                        if (controller != null) {
+                            val displayRotation = controller.getDisplayRotation()
+                            val sensorOrientation = controller.getSensorOrientation()
+                            val isFront = controller.isFrontFacing()
+                            
+                            val relativeRotation = kotlin.math.abs(sensorOrientation - displayRotation)
+                            isInputContentPortrait = (relativeRotation % 180) == 90
+                            
+                            rotation = if (displayRotation == 90 || displayRotation == 270) 270 else 0
+                        }
+                        
+                        // 延迟一段时间后再读像素，避免起播时相机未稳定导致全黑
+                        val elapsed = System.currentTimeMillis() - fboLoopStartMs
+                        val pastWarmup = elapsed >= fboReadWarmupMs
+                        // 跳帧调用 YOLO：根据 skipFrame 参数决定（0 表示不跳帧）
+                        // skipFrame = 0: 每帧都回调
+                        // skipFrame = n: 每隔 n 帧回调一次（第 1, n+2, 2n+3... 帧）
+                        yoloFrameCounter++
+                        val shouldReadForYolo = enableFrameCallback && frameEventSink != null && pastWarmup && 
+                            (frameSkip == 0 || ((yoloFrameCounter - 1) % (frameSkip + 1) == 0))
+                        val targetBuf = if (shouldReadForYolo) {
+                            // 环形池：使用模运算实现环形索引
+                            val idx = rgbaPoolIndex
+                            rgbaPoolIndex = (rgbaPoolIndex + 1) % rgbaBufferPoolSize
+                            rgbaBufferPool[idx]
+                        } else null
+
+                        renderer.renderFrame(
+                            cameraTexture = cameraTextureId,
+                            stMatrix = transformMatrix,
+                            videoWidth = cameraWidth,
+                            videoHeight = cameraHeight,
+                            mode = GlRenderer.ScaleMode.FIT,
+                            extraRotation = rotation,
+                            isInputContentPortrait = isInputContentPortrait,
+                            timestampNs = finalTimestampNs,
+                            fboReadTarget = targetBuf
+                        )
+
+                        if (targetBuf != null) {
+                            val address = NativeBridge.getDirectBufferAddress(targetBuf)
+                            if (address != 0L) {
+                                // 注意：Android 的 EventChannel.EventSink 必须在主线程调用（与 iOS 不同）
+                                // 但我们可以先切换到主线程，避免阻塞当前渲染线程
+                                scope.launch(Dispatchers.Main) {
+                                    try {
+                                        frameEventSink?.success(mapOf(
+                                            "type" to "fbo_rgba",
+                                            "address" to address,
+                                            "width" to glFboCanvasWidth,
+                                            "height" to glFboCanvasHeight,
+                                            "stride" to (glFboCanvasWidth * 4)
+                                        ))
+                                    } catch (e: Exception) {
+                                        android.util.Log.e("BbRtmpPlugin", "发送 FBO RGBA 数据失败", e)
+                                    }
+                                }
+                            } else {
+                                android.util.Log.e("BbRtmpPlugin", "获取 DirectByteBuffer 地址失败")
+                            }
+                        }
+                        
+                        frameCount++
+                        
+                        val frameTime = System.currentTimeMillis() - frameStartTime
+                        val sleepTime = 33 - frameTime
+                        if (sleepTime > 0) Thread.sleep(sleepTime)
+                        
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "渲染循环异常", e)
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("BbRtmpPlugin", "FBO 启动失败", e)
+            } finally {
+                isFboRenderLoopRunning = false
+                if (cameraTextureId != 0) {
+                    try {
+                        if (!inputSurfaceTexture.isReleased) inputSurfaceTexture.detachFromGLContext()
+                        android.opengl.GLES20.glDeleteTextures(1, intArrayOf(cameraTextureId), 0)
+                    } catch (e: Exception) {}
+                    cameraTextureId = 0
+                }
+                previewSurface?.release()
+                try {
+                    renderer.release()
+                    glRenderer = null
+                } catch (e: Exception) {}
+            }
+        }
+    }
+
+    private fun release() {
+        try {
+            // 1. 先停止推流和码率控制
+            rtmpStreamer?.stop()
+            bitrateController?.stop()
+            
+            // 2. 清除编码器回调，防止回调在释放后继续执行
+            videoEncoder?.setCallback(object : VideoEncoder.EncoderCallback {
+                override fun onEncodedData(data: ByteBuffer, info: MediaCodec.BufferInfo) {
+                    // 空回调，忽略所有数据
+                }
+                override fun onCodecConfig(sps: ByteArray, pps: ByteArray) {
+                    // 空回调，忽略配置
+                }
+                override fun onError(error: String) {
+                    // 空回调，忽略错误
+                }
+            })
+            audioEncoder?.setCallback(object : AudioEncoder.EncoderCallback {
+                override fun onEncodedData(data: ByteBuffer, info: MediaCodec.BufferInfo) {
+                    // 空回调，忽略所有数据
+                }
+                override fun onError(error: String) {
+                    // 空回调，忽略错误
+                }
+            })
+            
+            // 3. 停止 FBO 渲染循环（会等待循环真正结束）
+            stopFboRenderLoop()
+            
+            // 4. 停止服务
+            context?.let { ctx ->
+                val intent = android.content.Intent(ctx, RtmpService::class.java)
+                ctx.stopService(intent)
+            }
+            
+            // 5. 清理句柄映射
+            synchronized(handleLock) {
+                // 先关闭所有 Image
+                handleToImage.values.forEach { image ->
+                    try {
+                        image.close()
+                    } catch (e: Exception) {}
+                }
+                handleToImage.clear()
+
+                // 释放 AHardwareBuffer 指针（先解锁再释放）
+                handleToNativePtr.values.forEach { ptr ->
+                    if (ptr != 0L) {
+                        try {
+                            NativeBridge.unlockAHardwareBuffer(ptr)
+                        } catch (e: Exception) {}
+                        try {
+                            NativeBridge.releaseAHardwareBufferPtr(ptr)
+                        } catch (e: Exception) {}
+                    }
+                }
+                handleToNativePtr.clear()
+                
+                // 然后关闭所有 HardwareBuffer
+                handleToBuffer.values.forEach { buffer ->
+                    try {
+                        buffer.close()
+                    } catch (e: Exception) {}
+                }
+                handleToBuffer.clear()
+            }
+            
+            // 6. 释放 ImageReader
+            imageReaderSurface?.release()
+            imageReaderSurface = null
+            imageReader?.close()
+            imageReader = null
+            
+            // 7. 释放编码器和推流器（按顺序）
+            bitrateController?.release()
+            rtmpStreamer?.release()
+            videoEncoder?.release()
+            audioEncoder?.release()
+            
+            // 8. 关闭相机
+            cameraController?.closeCamera()
+            
+            // 9. 释放纹理
+            textureEntry?.release()
+
+            // 10. 清空引用
+            bitrateController = null
+            rtmpStreamer = null
+            videoEncoder = null
+            audioEncoder = null
+            cameraController = null
+            textureEntry = null
+            streamWidth = 0
+            streamHeight = 0
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "释放资源失败", e)
+        }
+    }
+
+    private fun enableFrameCallback(call: MethodCall, result: Result) {
+        try {
+            val enable = call.argument<Boolean>("enable") ?: false
+            val skipFrame = call.argument<Int>("skipFrame") ?: 0
+            enableFrameCallback = enable
+            frameSkip = skipFrame.coerceAtLeast(0) // 确保 >= 0
+            result.success(enable)
+        } catch (e: Exception) {
+            result.error("ENABLE_FRAME_CALLBACK_ERROR", e.message, null)
+        }
+    }
+
+    private fun releasePixelBufferHandle(call: MethodCall, result: Result) {
+        try {
+            // 兼容 Dart 传入的 Integer/Long
+            val handle = call.argument<Number>("handle")?.toLong() ?: 0L
+            val released = synchronized(handleLock) {
+                val buffer = handleToBuffer.remove(handle)
+                val image = handleToImage.remove(handle)
+                val nativePtr = handleToNativePtr.remove(handle) ?: 0L
+                
+                var success = false
+                if (buffer != null && image != null) {
+                    try {
+                        // 如果已锁定，先解锁
+                        if (nativePtr != 0L) {
+                            try {
+                                NativeBridge.unlockAHardwareBuffer(nativePtr)
+                            } catch (e: Exception) {
+                                android.util.Log.w("BbRtmpPlugin", "解锁 AHardwareBuffer 失败", e)
+                            }
+                            // 释放 native 指针
+                            NativeBridge.releaseAHardwareBufferPtr(nativePtr)
+                        }
+                        // 先关闭 Image，这会释放 HardwareBuffer
+                        image.close()
+                        // 然后关闭 HardwareBuffer（虽然 Image.close() 应该已经关闭了，但为了安全还是调用）
+                        buffer.close()
+                        success = true
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "释放句柄失败", e)
+                        // 即使关闭失败，也尝试关闭 Image
+                        try {
+                            image.close()
+                        } catch (e2: Exception) {
+                            android.util.Log.e("BbRtmpPlugin", "关闭 Image 失败", e2)
+                        }
+                    }
+                } else if (buffer != null) {
+                    // 只有 buffer 没有 image，直接关闭 buffer
+                    try {
+                        if (nativePtr != 0L) {
+                            try {
+                                NativeBridge.unlockAHardwareBuffer(nativePtr)
+                            } catch (e: Exception) {
+                                android.util.Log.w("BbRtmpPlugin", "解锁 AHardwareBuffer 失败", e)
+                            }
+                            NativeBridge.releaseAHardwareBufferPtr(nativePtr)
+                        }
+                        buffer.close()
+                        success = true
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "关闭 HardwareBuffer 失败", e)
+                    }
+                } else if (image != null) {
+                    // 只有 image 没有 buffer，直接关闭 image
+                    try {
+                        if (nativePtr != 0L) {
+                            try {
+                                NativeBridge.unlockAHardwareBuffer(nativePtr)
+                            } catch (e: Exception) {
+                                android.util.Log.w("BbRtmpPlugin", "解锁 AHardwareBuffer 失败", e)
+                            }
+                            NativeBridge.releaseAHardwareBufferPtr(nativePtr)
+                        }
+                        image.close()
+                        success = true
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "关闭 Image 失败", e)
+                    }
+                } else if (nativePtr != 0L) {
+                    // 只有 native 指针
+                    try {
+                        try {
+                            NativeBridge.unlockAHardwareBuffer(nativePtr)
+                        } catch (e: Exception) {
+                            android.util.Log.w("BbRtmpPlugin", "解锁 AHardwareBuffer 失败", e)
+                        }
+                        NativeBridge.releaseAHardwareBufferPtr(nativePtr)
+                        success = true
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "释放 AHardwareBuffer 指针失败", e)
+                    }
+                }
+                success
+            }
+            result.success(released)
+        } catch (e: Exception) {
+            result.error("RELEASE_HANDLE_ERROR", e.message, null)
+        }
+    }
+
+    /**
+     * 获取 Image Planes 数据（用于 YUV_420_888 格式，零拷贝）
+     * 返回 Y、U、V 平面的 DirectByteBuffer 地址和 stride 信息
+     */
+    private fun getImagePlanes(call: MethodCall, result: Result) {
+        try {
+            val handle = call.argument<Number>("handle")?.toLong() ?: 0L
+            val image = handleToImage[handle]
+            
+            if (image == null) {
+                result.error("HANDLE_NOT_FOUND", "句柄不存在", null)
+                return
+            }
+            
+            if (image.format != android.graphics.ImageFormat.YUV_420_888) {
+                result.error("INVALID_FORMAT", "图像格式不是 YUV_420_888", null)
+                return
+            }
+            
+            val planes = image.planes
+            if (planes.size < 3) {
+                result.error("INVALID_PLANES", "YUV_420_888 需要至少 3 个平面", null)
+                return
+            }
+            
+            val yPlane = planes[0]
+            val uPlane = planes[1]
+            val vPlane = planes[2]
+            
+            // 获取 DirectByteBuffer（零拷贝）
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+            
+            // 获取 buffer 的 native 地址
+            val yAddress = if (yBuffer.isDirect) {
+                // DirectByteBuffer 可以直接获取地址
+                val yAddressField = yBuffer.javaClass.getDeclaredField("address")
+                yAddressField.isAccessible = true
+                yAddressField.getLong(yBuffer)
+            } else {
+                // 如果不是 DirectByteBuffer，需要转换为 DirectByteBuffer（会有一次拷贝）
+                val yArray = ByteArray(yBuffer.remaining())
+                yBuffer.duplicate().get(yArray)
+                val yDirectBuffer = java.nio.ByteBuffer.allocateDirect(yArray.size)
+                yDirectBuffer.put(yArray)
+                yDirectBuffer.rewind()
+                val yAddressField = yDirectBuffer.javaClass.getDeclaredField("address")
+                yAddressField.isAccessible = true
+                yAddressField.getLong(yDirectBuffer)
+            }
+            
+            val uAddress = if (uBuffer.isDirect) {
+                val uAddressField = uBuffer.javaClass.getDeclaredField("address")
+                uAddressField.isAccessible = true
+                uAddressField.getLong(uBuffer)
+            } else {
+                val uArray = ByteArray(uBuffer.remaining())
+                uBuffer.duplicate().get(uArray)
+                val uDirectBuffer = java.nio.ByteBuffer.allocateDirect(uArray.size)
+                uDirectBuffer.put(uArray)
+                uDirectBuffer.rewind()
+                val uAddressField = uDirectBuffer.javaClass.getDeclaredField("address")
+                uAddressField.isAccessible = true
+                uAddressField.getLong(uDirectBuffer)
+            }
+            
+            val vAddress = if (vBuffer.isDirect) {
+                val vAddressField = vBuffer.javaClass.getDeclaredField("address")
+                vAddressField.isAccessible = true
+                vAddressField.getLong(vBuffer)
+            } else {
+                val vArray = ByteArray(vBuffer.remaining())
+                vBuffer.duplicate().get(vArray)
+                val vDirectBuffer = java.nio.ByteBuffer.allocateDirect(vArray.size)
+                vDirectBuffer.put(vArray)
+                vDirectBuffer.rewind()
+                val vAddressField = vDirectBuffer.javaClass.getDeclaredField("address")
+                vAddressField.isAccessible = true
+                vAddressField.getLong(vDirectBuffer)
+            }
+            
+            result.success(mapOf(
+                "yPlane" to yAddress,
+                "uPlane" to uAddress,
+                "vPlane" to vAddress,
+                "yStride" to yPlane.rowStride,
+                "uStride" to uPlane.rowStride,
+                "vStride" to vPlane.rowStride,
+                "uPixelStride" to uPlane.pixelStride,
+                "vPixelStride" to vPlane.pixelStride,
+                "width" to image.width,
+                "height" to image.height
+            ))
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "获取 Image Planes 失败", e)
+            result.error("GET_PLANES_ERROR", e.message, null)
+        }
+    }
+
+    /**
+     * 获取 HardwareBuffer 的虚拟地址（用于传递给需要直接访问内存的插件，如 Yolo11）
+     * 优先使用 AHardwareBuffer lock 获取连续内存地址（零拷贝）
+     * 注意：返回的地址指向连续内存，但格式可能不是标准 NV12，Yolo11 插件需要适配实际格式
+     */
+    private fun getZoomRange(result: Result) {
+        try {
+            val controller = cameraController ?: run {
+                result.error("NOT_INITIALIZED", "相机未初始化", null)
+                return
+            }
+            
+            val zoomRange = controller.getZoomRange()
+            result.success(zoomRange)
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "获取 zoom 范围失败", e)
+            result.error("GET_ZOOM_RANGE_ERROR", e.message, null)
+        }
+    }
+    
+    private fun setZoom(call: MethodCall, result: Result) {
+        try {
+            val zoom = call.argument<Double>("zoom")?.toFloat() ?: run {
+                result.error("INVALID_ARGUMENT", "zoom 参数无效", null)
+                return
+            }
+            
+            val controller = cameraController ?: run {
+                result.error("NOT_INITIALIZED", "相机未初始化", null)
+                return
+            }
+            
+            val success = controller.setZoom(zoom)
+            if (success) {
+                result.success(true)
+            } else {
+                result.error("SET_ZOOM_FAILED", "设置 zoom 失败", null)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("BbRtmpPlugin", "设置 zoom 失败", e)
+            result.error("SET_ZOOM_ERROR", e.message, null)
+        }
+    }
+    
+    private fun getHardwareBufferNativeHandle(call: MethodCall, result: Result) {
+        try {
+            val handle = call.argument<Number>("handle")?.toLong() ?: 0L
+            val image = handleToImage[handle]
+            val buffer = handleToBuffer[handle]
+            
+            val virtualAddress = synchronized(handleLock) {
+                if (buffer != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    try {
+                        // 优先使用 AHardwareBuffer lock 获取连续内存地址（零拷贝）
+                        // 这是最可能提供连续数据的方式
+                        var aBufferPtr = handleToNativePtr[handle]
+                        if (aBufferPtr == null || aBufferPtr == 0L) {
+                            aBufferPtr = NativeBridge.getAHardwareBufferPtr(buffer)
+                            if (aBufferPtr != 0L) {
+                                handleToNativePtr[handle] = aBufferPtr
+                            }
+                        }
+                        
+                        if (aBufferPtr != 0L) {
+                            // 锁定 buffer 并获取虚拟地址（连续内存，零拷贝）
+                            val vAddr = NativeBridge.lockAHardwareBuffer(aBufferPtr)
+                            if (vAddr != 0L) {
+                                // 获取图像信息用于日志
+                                val width = image?.width ?: 0
+                                val height = image?.height ?: 0
+                                val format = image?.format ?: 0
+                                return@synchronized vAddr
+                            } else {
+                                android.util.Log.e("BbRtmpPlugin", "锁定 AHardwareBuffer 失败")
+                            }
+                        }
+                        null
+                    } catch (e: Exception) {
+                        android.util.Log.e("BbRtmpPlugin", "无法获取 AHardwareBuffer 虚拟地址", e)
+                        null
+                    }
+                } else {
+                    null
+                }
+            }
+            
+            if (virtualAddress != null && virtualAddress != 0L) {
+                result.success(virtualAddress)
+            } else {
+                result.error("HANDLE_NOT_FOUND", "句柄不存在或无法获取虚拟地址", null)
+            }
+        } catch (e: Exception) {
+            result.error("GET_NATIVE_HANDLE_ERROR", e.message, null)
+        }
     }
 
     private val lifecycleCallbacks = object : android.app.Application.ActivityLifecycleCallbacks {
-        override fun onActivityPaused(activity: android.app.Activity) {
-        }
-
-        override fun onActivityResumed(activity: android.app.Activity) {
-        }
-
+        override fun onActivityPaused(activity: android.app.Activity) {}
+        override fun onActivityResumed(activity: android.app.Activity) {}
         override fun onActivityStarted(activity: android.app.Activity) {
             if (activity == this@BbRtmpPlugin.activity) {
-                android.util.Log.d("BbRtmpPlugin", "App entering foreground (Activity Started) - Re-triggering video pipeline")
                 isInBackground = false
                 rtmpStreamer?.stopHeartbeat()
-                
-                // Video Resume Fix: Re-trigger camera session and request keyframe
                 if (rtmpStreamer?.isStreaming() == true) {
-                    val controller = cameraController
-                    if (controller != null) {
+                    cameraController?.let { controller ->
                         scope.launch(Dispatchers.Main) {
                             if (!controller.isCameraDeviceOpen()) {
-                                android.util.Log.w("BbRtmpPlugin", "Camera device was closed by OS, performing full re-open")
-                                
-                                // Stop old loop and clean up references to ensure a fresh start
                                 stopFboRenderLoop()
                                 glRenderer = null
-                                
-                                // Re-create the input texture (CameraController will attach it to GL context later)
                                 fboInputSurfaceTexture = SurfaceTexture(false)
                                 fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
-                                
-                                // Full re-open flow
-                                val success = controller.openCamera(glCameraWidth, glCameraHeight, fboInputSurfaceTexture!!)
-                                if (success) {
-                                    android.util.Log.d("BbRtmpPlugin", "Camera re-opened successfully on resume")
-                                }
+                                controller.openCamera(glCameraWidth, glCameraHeight, fboInputSurfaceTexture!!)
                             } else {
-                                android.util.Log.d("BbRtmpPlugin", "Requesting keyframe and re-creating camera capture session for resume")
                                 videoEncoder?.requestKeyFrame()
                                 try {
-                                    controller.createCaptureSession(emptyList<android.view.Surface>())
-                                    android.util.Log.d("BbRtmpPlugin", "Camera capture session re-triggered successfully")
-                                } catch (e: Exception) {
-                                    android.util.Log.e("BbRtmpPlugin", "Failed to re-trigger camera capture session", e)
-                                }
+                                    controller.createCaptureSession(emptyList())
+                                } catch (e: Exception) {}
                             }
                         }
                     }
                 }
             }
         }
-
         override fun onActivityStopped(activity: android.app.Activity) {
             if (activity == this@BbRtmpPlugin.activity) {
-                android.util.Log.d("BbRtmpPlugin", "App entering background (Activity Stopped)")
                 isInBackground = true
-                if (rtmpStreamer?.isStreaming() == true) {
-                    rtmpStreamer?.startHeartbeat()
-                }
+                if (rtmpStreamer?.isStreaming() == true) rtmpStreamer?.startHeartbeat()
             }
         }
-
         override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
         override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
         override fun onActivityDestroyed(activity: android.app.Activity) {}
@@ -521,589 +1649,4 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         activity?.application?.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
         this.activity = null
     }
-
-    // Since we don't have a direct "appDidEnterBackground" in ActivityAware, 
-    // we can use the result of getStatus or other methods to check if we are minimized
-    // OR ideally, we can use the Lifecycle library if available.
-    // For now, let's add a manual check or use the Activity's lifecycle.
-
-    private suspend fun changeResolution(call: MethodCall, result: Result) {
-        try {
-            var targetWidth = call.argument<Int>("width") ?: run {
-                result.error("INVALID_ARGUMENT", "width 不能为空", null)
-                return
-            }
-            var targetHeight = call.argument<Int>("height") ?: run {
-                result.error("INVALID_ARGUMENT", "height 不能为空", null)
-                return
-            }
-
-            val controller = cameraController ?: run {
-                result.error("NOT_INITIALIZED", "未初始化", null)
-                return
-            }
-
-            val texture = textureEntry?.surfaceTexture() ?: run {
-                result.error("NO_TEXTURE", "无纹理", null)
-                return
-            }
-
-            // 判断用户设置的方向
-            val isPortrait = targetWidth < targetHeight
-            
-            // 保存用户设置的分辨率和方向（用于预览显示）
-            this.isPortraitMode = isPortrait
-            this.userSetWidth = targetWidth
-            this.userSetHeight = targetHeight
-            
-            // FBO 画布分辨率 = 标准横屏分辨率（始终宽>=高，如 1920x1080）
-            // 推流和预览 Surface 都使用标准横屏分辨率
-            val fboCanvasWidth = kotlin.math.max(targetWidth, targetHeight)  // 标准横屏：宽 >= 高
-            val fboCanvasHeight = kotlin.math.min(targetWidth, targetHeight)
-            
-            // 保存推流分辨率（标准横屏分辨率）
-            this.streamWidth = fboCanvasWidth
-            this.streamHeight = fboCanvasHeight
-            
-            android.util.Log.d("BbRtmpPlugin", "用户设置分辨率: ${targetWidth}x${targetHeight} (${if (isPortrait) "竖屏" else "横屏"})")
-            android.util.Log.d("BbRtmpPlugin", "FBO 画布分辨率（标准横屏）: ${fboCanvasWidth}x${fboCanvasHeight}")
-            android.util.Log.d("BbRtmpPlugin", "推流分辨率（标准横屏）: ${fboCanvasWidth}x${fboCanvasHeight}")
-
-            // 2. 停止推流和编码
-            rtmpStreamer?.stop()
-            bitrateController?.stop()
-
-            // 3. 关闭旧的捕获会话（必须在主线程）
-            scope.launch(Dispatchers.Main) {
-                try {
-                    controller.closeCamera()
-                    
-                    // 4. 释放旧编码器
-                    videoEncoder?.release()
-                    audioEncoder?.release()
-
-                    // 5. 重新初始化编码器（使用标准横屏分辨率）
-                    val bitrate = bitrateController?.getCurrentBitrate() ?: 2000000
-                    videoEncoder = VideoEncoder()
-                    val encoderSurface = videoEncoder!!.initialize(fboCanvasWidth, fboCanvasHeight, bitrate, 30)
-                    if (encoderSurface == null) {
-                        result.error("ENCODER_INIT_FAILED", "视频编码器初始化失败", null)
-                        return@launch
-                    }
-
-                    // 6. 重新初始化音频编码器
-                    audioEncoder?.let {
-                        val audio = AudioEncoder()
-                        if (audio.initialize()) {
-                            audioEncoder = audio
-                        }
-                    }
-
-                    // 7. 重新初始化 RTMP
-                    rtmpStreamer?.release()
-                    rtmpStreamer = RtmpStreamer()
-                    if (!rtmpStreamer!!.initialize(rtmpUrl, videoEncoder!!, audioEncoder)) {
-                        result.error("RTMP_INIT_FAILED", "RTMP 重新初始化失败", null)
-                        return@launch
-                    }
-
-                    // 8. 设置元数据（使用标准横屏分辨率）
-                    val audioSampleRate = audioEncoder?.getSampleRate() ?: 44100
-                    val audioChannels = audioEncoder?.getChannelCount() ?: 1
-                    rtmpStreamer!!.setMetadata(fboCanvasWidth, fboCanvasHeight, bitrate, 30, audioSampleRate, audioChannels)
-
-                    // 9. 更新码率控制器
-                    bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, controller)
-                    bitrateController!!.initialize(bitrate, fboCanvasWidth, fboCanvasHeight)
-
-                    // 10. 更新预览纹理大小（使用标准横屏分辨率，因为 Camera2 要求所有 Surface 分辨率匹配）
-                    texture.setDefaultBufferSize(fboCanvasWidth, fboCanvasHeight)
-                    
-                    // 11. 更新 OpenGL 参数
-                    this@BbRtmpPlugin.glFboCanvasWidth = fboCanvasWidth
-                    this@BbRtmpPlugin.glFboCanvasHeight = fboCanvasHeight
-                    this@BbRtmpPlugin.glEncoderSurface = encoderSurface
-
-                    // 11. 重新打开相机（使用推流分辨率）
-                    controller.setStateCallback(object : CameraController.CameraStateCallback {
-                        override fun onCameraOpened() {
-                            scope.launch(Dispatchers.Main) {
-                                // 获取相机实际选择的分辨率并更新
-                                val actualSize = controller.getPreviewSize()
-                                if (actualSize != null) {
-                                    this@BbRtmpPlugin.cameraOutputWidth = actualSize.width
-                                    this@BbRtmpPlugin.cameraOutputHeight = actualSize.height
-                                    android.util.Log.d("BbRtmpPlugin", "切换分辨率后，相机实际输出分辨率: ${actualSize.width}x${actualSize.height}")
-                                }
-                                
-                                // 创建捕获会话
-                                controller.createCaptureSession(encoderSurface)
-                                result.success(null)
-                            }
-                        }
-
-                        override fun onCameraError(error: String) {
-                            result.error("CAMERA_ERROR", "切换分辨率时相机错误: $error", null)
-                        }
-                    })
-
-                    // 12. 打开相机（使用推流分辨率）
-                    // 12. 打开相机（使用相机硬件支持的分辨率，由 CameraController 自动选择）
-                    // 注意：这里传入的是用户设置的分辨率，用于 CameraController 选择最接近的硬件分辨率
-                    val success = controller.openCamera(targetWidth, targetHeight, texture)
-                    if (!success) {
-                        result.error("CHANGE_RESOLUTION_FAILED", "打开相机失败", null)
-                    }
-                } catch (e: Exception) {
-                    result.error("CHANGE_RESOLUTION_ERROR", "切换分辨率异常: ${e.message}", null)
-                }
-            }
-        } catch (e: Exception) {
-            result.error("CHANGE_RESOLUTION_ERROR", "切换分辨率异常: ${e.message}", null)
-        }
-    }
-
-    private fun setBitrate(call: MethodCall, result: Result) {
-        try {
-            val bitrate = call.argument<Int>("bitrate") ?: run {
-                result.error("INVALID_ARGUMENT", "bitrate 不能为空", null)
-                return
-            }
-
-            bitrateController?.setBitrate(bitrate)
-            result.success(null)
-        } catch (e: Exception) {
-            result.error("SET_BITRATE_ERROR", "设置码率失败: ${e.message}", null)
-        }
-    }
-
-    private fun getStatus(result: Result) {
-        try {
-            val isStreaming = rtmpStreamer?.isStreaming() ?: false
-            val currentBitrate = bitrateController?.getCurrentBitrate() ?: 0
-            val cameraId = cameraController?.getCurrentCameraId()
-            
-            // 推流分辨率（用户设置的分辨率，FBO 画布分辨率）
-            val streamWidthFinal = this.streamWidth
-            val streamHeightFinal = this.streamHeight
-            
-            // 预览分辨率（用于计算预览宽高比）
-            // 预览显示的是 FBO 输出（标准横屏分辨率），但需要根据用户设置的方向来显示宽高比
-            // 返回用户设置的分辨率，用于 Flutter 端正确显示宽高比
-            // 如果用户设置的是竖屏（1080x1920），预览应该显示为竖屏比例（9:16）
-            // 如果用户设置的是横屏（1920x1080），预览应该显示为横屏比例（16:9）
-            // 但实际 FBO 和预览 Surface 都是标准横屏分辨率（1920x1080）
-            // 确保预览分辨率符合当前方向
-            // 如果 isPortraitMode 为 true，确保 w < h
-            // 如果 isPortraitMode 为 false，确保 w > h
-            // 预览分辨率（用于计算预览宽高比）
-            // 直接返回 FBO 画布分辨率（标准横屏），确保 Flutter AspectRatio 与纹理缓冲区一致
-            // 避免 Flutter 强制拉伸导致变形
-            val finalPreviewWidth = streamWidthFinal
-            val finalPreviewHeight = streamHeightFinal
-
-            android.util.Log.d("BbRtmpPlugin", "getStatus: isPortraitMode=$isPortraitMode, userSet=${userSetWidth}x${userSetHeight}, FBO=${streamWidthFinal}x${streamHeightFinal}, preview=${finalPreviewWidth}x${finalPreviewHeight}")
-            android.util.Log.d("BbRtmpPlugin", "getStatus: streamWidth=$streamWidth, streamHeight=$streamHeight")
-
-            val status = mapOf(
-                "isStreaming" to isStreaming,
-                "currentBitrate" to currentBitrate,
-                "fps" to 30.0, // TODO: 从编码器获取实际帧率
-                "width" to streamWidthFinal, // 推流分辨率（用户设置，FBO 画布）
-                "height" to streamHeightFinal, // 推流分辨率（用户设置，FBO 画布）
-                "previewWidth" to finalPreviewWidth, // 预览宽度（用于计算宽高比）
-                "previewHeight" to finalPreviewHeight, // 预览高度（用于计算宽高比）
-                "cameraId" to (cameraId ?: "")
-            )
-
-            result.success(status)
-        } catch (e: Exception) {
-            result.error("GET_STATUS_ERROR", "获取状态失败: ${e.message}", null)
-        }
-    }
-
-    /**
-     * 启动 FBO 渲染循环
-     * 注意：在渲染线程中初始化 EGL 和创建纹理
-     * @param inputSurfaceTexture FBO 输入 SurfaceTexture（相机输出）
-     * @param previewSurfaceTexture 预览 SurfaceTexture（FBO 输出，用于 Flutter 显示）
-     * @param encoderSurface 编码器 Surface（FBO 输出，用于推流）
-     * @param canvasWidth FBO 画布宽度
-     * @param canvasHeight FBO 画布高度
-     * @param cameraWidth 相机纹理宽度
-     * @param cameraHeight 相机纹理高度
-     */
-    private fun startFboRenderLoop(
-        inputSurfaceTexture: SurfaceTexture,
-        previewSurfaceTexture: SurfaceTexture,
-        encoderSurface: Surface,
-        canvasWidth: Int,
-        canvasHeight: Int,
-        cameraWidth: Int,
-        cameraHeight: Int
-    ) {
-        scope.launch(Dispatchers.Default) {
-            val renderer = glRenderer ?: return@launch
-            val ctx = context ?: return@launch
-            
-            android.util.Log.d("BbRtmpPlugin", "启动 FBO 渲染循环（在渲染线程中）")
-            
-            // 创建预览 Surface（从预览 SurfaceTexture）
-            var previewSurface: Surface? = null
-            try {
-                previewSurface = Surface(previewSurfaceTexture)
-                
-                // 在渲染线程中初始化 EGL（使用编码器 Surface 和预览 Surface）
-                renderer.initEgl(encoderSurface, previewSurface)
-                android.util.Log.d("BbRtmpPlugin", "EGL 初始化成功（在渲染线程中，双 EGLSurface 方案）")
-            } catch (e: Exception) {
-                android.util.Log.e("BbRtmpPlugin", "EGL 初始化失败", e)
-                previewSurface?.release()
-                return@launch
-            }
-            
-            // 在渲染线程中初始化 OpenGL
-            try {
-                renderer.initGl(canvasWidth, canvasHeight)
-                android.util.Log.d("BbRtmpPlugin", "OpenGL 初始化成功（在渲染线程中）")
-            } catch (e: Exception) {
-                android.util.Log.e("BbRtmpPlugin", "OpenGL 初始化失败", e)
-                return@launch
-            }
-            
-            // 在渲染线程中创建摄像头纹理（必须在 EGL 上下文绑定后）
-            val textures = IntArray(1)
-            android.opengl.GLES20.glGenTextures(1, textures, 0)
-            cameraTextureId = textures[0]
-            
-            if (cameraTextureId == 0) {
-                android.util.Log.e("BbRtmpPlugin", "无法创建摄像头纹理，停止渲染循环")
-                return@launch
-            }
-            
-            // 设置纹理参数
-            android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
-            android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MIN_FILTER, android.opengl.GLES20.GL_LINEAR)
-            android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MAG_FILTER, android.opengl.GLES20.GL_LINEAR)
-            android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_S, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
-            android.opengl.GLES20.glTexParameteri(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_T, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
-            android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
-            
-            android.util.Log.d("BbRtmpPlugin", "摄像头纹理已创建: $cameraTextureId")
-            
-            // 将 FBO 输入 SurfaceTexture 绑定到纹理（必须在创建 Surface 之前）
-            try {
-                inputSurfaceTexture.attachToGLContext(cameraTextureId)
-                android.util.Log.d("BbRtmpPlugin", "FBO 输入 SurfaceTexture 已绑定到纹理 $cameraTextureId")
-            } catch (e: Exception) {
-                android.util.Log.e("BbRtmpPlugin", "绑定 FBO 输入 SurfaceTexture 失败", e)
-                return@launch
-            }
-            
-            // 将 FBO texture 绑定到预览 SurfaceTexture（用于 Flutter 显示）
-            // 注意：previewSurfaceTexture 是 Flutter 的 SurfaceTexture，需要从 FBO texture 更新
-            // 这里我们需要创建一个额外的渲染步骤，将 FBO texture 渲染到 previewSurfaceTexture
-            // 但根据单 EGLSurface 方案，preview 应该通过 SurfaceTexture 直接消费 FBO texture
-            // 实际上，我们需要在 renderFrame 之后，将 FBO texture 的内容更新到 previewSurfaceTexture
-            // 这需要额外的渲染步骤，但不在 EGLSurface 中，而是在当前的 EGLContext 中
-            
-            // 在主线程创建 Surface 并添加到相机捕获会话
-            // 相机只输出到 FBO 输入 SurfaceTexture
-            // 注意：CameraController.openCamera 已经创建了 previewSurface（来自 fboInputSurfaceTexture）
-            // createCaptureSession 会自动添加 previewSurface，我们传入空列表即可
-            scope.launch(Dispatchers.Main) {
-                // 传入空列表，createCaptureSession 会自动添加 previewSurface（FBO 输入 Surface）
-                cameraController?.createCaptureSession(emptyList<Surface>())
-                android.util.Log.d("BbRtmpPlugin", "FBO 输入 Surface（来自 CameraController.previewSurface）已添加到相机捕获会话")
-            }
-            
-            // 设置渲染循环运行标志
-            isFboRenderLoopRunning = true
-            
-            var frameCount = 0L
-            var lastLogTime = System.currentTimeMillis()
-            var errorCount = 0L
-            var lastTimestampNs = 0L  // 用于确保时间戳递增
-            
-            while (isFboRenderLoopRunning && glRenderer != null && cameraTextureId != 0) {
-                try {
-                    val frameStartTime = System.currentTimeMillis()
-                    
-                    // 注意：makeCurrent 只需要在循环开始前调用一次
-                    // 在循环中重复调用可能导致 EGL_BAD_ACCESS 错误
-                    
-                    // 更新 FBO 输入 SurfaceTexture（获取新的摄像头帧）
-                    // 注意：updateTexImage 必须在正确的线程中调用，且需要在 EGL 上下文中
-                    // 使用 onFrameAvailable 驱动，而不是轮询 + sleep
-                    try {
-                        inputSurfaceTexture.updateTexImage()
-                    } catch (e: Exception) {
-                        errorCount++
-                        if (errorCount % 30 == 0L) {
-                            android.util.Log.w("BbRtmpPlugin", "updateTexImage 失败 (已失败 $errorCount 次): ${e.message}")
-                        }
-                        // 不再使用 Thread.sleep，等待下一帧通过 onFrameAvailable 触发
-                        continue
-                    }
-                    
-                    // 1. Skip GPU work if in background to save power and avoid potential EGL errors
-                    if (isInBackground) {
-                        frameCount++
-                        // Controlled sleep to avoid busy loop in background
-                        val targetFrameTime = 1000L / 30
-                        Thread.sleep(targetFrameTime)
-                        continue
-                    }
-                    
-                    // 获取帧时间戳（纳秒）- 必须在 updateTexImage() 之后立即获取
-                    // 这对于 MediaCodec 很重要，如果时间戳为 0 或倒退，编码器可能无法正确处理帧
-                    val timestampNs = inputSurfaceTexture.timestamp
-                    
-                    // 确保时间戳递增（防止时间戳倒退导致编码器丢帧）
-                    val finalTimestampNs = if (timestampNs > 0 && timestampNs > lastTimestampNs) {
-                        timestampNs
-                    } else if (timestampNs > 0 && timestampNs <= lastTimestampNs) {
-                        // 时间戳倒退，使用上一个时间戳 + 增量（约 33ms for 30fps）
-                        lastTimestampNs + 33_333_333L  // 约 33.33ms
-                    } else {
-                        // 时间戳为 0，使用系统时间作为后备方案
-                        val systemTime = System.nanoTime()
-                        if (systemTime > lastTimestampNs) {
-                            systemTime
-                        } else {
-                            lastTimestampNs + 33_333_333L
-                        }
-                    }
-                    
-                    // 更新最后的时间戳
-                    lastTimestampNs = finalTimestampNs
-                    
-                    // 调试：每 30 帧打印一次时间戳
-                    if (frameCount % 30 == 0L) {
-                        android.util.Log.d("BbRtmpPlugin", "帧时间戳: SurfaceTexture=$timestampNs ns, 使用=${if (timestampNs > 0) "SurfaceTexture" else "System.nanoTime()"} ($finalTimestampNs ns)")
-                    }
-                    
-                    // 获取 FBO 输入 SurfaceTexture 的变换矩阵（用于处理坐标变换）
-                    val transformMatrix = FloatArray(16)
-                    inputSurfaceTexture.getTransformMatrix(transformMatrix)
-                    
-                    // 调试：每 30 帧打印一次变换矩阵和纹理信息（用于验证相机纹理的实际尺寸和方向）
-                    if (frameCount % 30 == 0L) {
-                        android.util.Log.d("BbRtmpPlugin", "=== 相机硬件纹理信息 ===")
-                        android.util.Log.d("BbRtmpPlugin", "硬件纹理尺寸: ${glCameraWidth}x${glCameraHeight} (宽${if (glCameraWidth > glCameraHeight) ">" else if (glCameraWidth < glCameraHeight) "<" else "="}高)")
-                        android.util.Log.d("BbRtmpPlugin", "SurfaceTexture 变换矩阵 2x2: [${transformMatrix[0]}, ${transformMatrix[1]}, ${transformMatrix[4]}, ${transformMatrix[5]}]")
-                        
-                        // 分析变换矩阵，判断纹理内容的方向
-                        // 变换矩阵 [a, b, c, d] 表示：
-                        // x' = a*x + c*y
-                        // y' = b*x + d*y
-                        val a = transformMatrix[0]
-                        val b = transformMatrix[1]
-                        val c = transformMatrix[4]
-                        val d = transformMatrix[5]
-                        
-                        // 判断旋转角度
-                        when {
-                            a == 1.0f && b == 0.0f && c == 0.0f && d == 1.0f -> {
-                                android.util.Log.d("BbRtmpPlugin", "纹理内容方向: 无旋转（0度）")
-                            }
-                            a == 0.0f && b == -1.0f && c == 1.0f && d == 0.0f -> {
-                                android.util.Log.d("BbRtmpPlugin", "纹理内容方向: 逆时针旋转90度（竖屏内容）")
-                            }
-                            a == -1.0f && b == 0.0f && c == 0.0f && d == -1.0f -> {
-                                android.util.Log.d("BbRtmpPlugin", "纹理内容方向: 旋转180度")
-                            }
-                            a == 0.0f && b == 1.0f && c == -1.0f && d == 0.0f -> {
-                                android.util.Log.d("BbRtmpPlugin", "纹理内容方向: 顺时针旋转90度（竖屏内容）")
-                            }
-                            else -> {
-                                android.util.Log.d("BbRtmpPlugin", "纹理内容方向: 未知变换 (a=$a, b=$b, c=$c, d=$d)")
-                            }
-                        }
-                        android.util.Log.d("BbRtmpPlugin", "=========================")
-                    }
-                    
-                    // 渲染：直接将相机纹理贴到 FBO 画布上（不做任何旋转、裁剪、改变）
-                    try {
-                        // 调试：每 30 帧打印一次渲染信息
-                        if (frameCount % 30 == 0L) {
-                            android.util.Log.d("BbRtmpPlugin", "=== FBO 渲染信息 ===")
-                            android.util.Log.d("BbRtmpPlugin", "FBO 画布尺寸: ${glFboCanvasWidth}x${glFboCanvasHeight}")
-                            android.util.Log.d("BbRtmpPlugin", "相机纹理尺寸: ${glCameraWidth}x${glCameraHeight}")
-                        }
-                        
-                        // 计算渲染到 FBO 时需要的旋转角度
-                        // 关键：Camera 的方向永远由「传感器 + Display Rotation」决定，和 isPortraitMode 无关
-                        // 必须根据 sensorOrientation 和 displayRotation 计算正确的旋转角度
-                        val controller = cameraController
-                        var rotation = 0
-                        var isInputContentPortrait = false
-                        
-                        if (controller != null) {
-                            val displayRotation = controller.getDisplayRotation()
-                            val sensorOrientation = controller.getSensorOrientation()
-                            val isFront = controller.isFrontFacing()
-                            
-                            // 1. 计算输入内容是否为竖屏 (isInputContentPortrait)
-                            // 逻辑：如果 (Sensor - Display) % 180 == 90，则是竖屏
-                            // 例如：
-                            // Portrait (Display 0):
-                            //   Front (Sensor 270): |270 - 0| = 270 % 180 = 90 -> Portrait
-                            //   Back (Sensor 90): |90 - 0| = 90 % 180 = 90 -> Portrait
-                            // Landscape (Display 90):
-                            //   Front (Sensor 270): |270 - 90| = 180 % 180 = 0 -> Landscape
-                            //   Back (Sensor 90): |90 - 90| = 0 % 180 = 0 -> Landscape
-                            val relativeRotation = kotlin.math.abs(sensorOrientation - displayRotation)
-                            isInputContentPortrait = (relativeRotation % 180) == 90
-                            
-                            // 2. 计算旋转角度 (rotation)
-                            // 根据用户反馈调整：
-                            // Front Portrait: 0 (User said upright)
-                            // Back Portrait: 90 (User said sideways, needs 90 CW to fix?)
-                            // Landscape: 270 (User said sideways, needs -90/270 CW to fix?)
-                            
-                            rotation = if (isFront) {
-                                if (displayRotation == 90 || displayRotation == 270) {
-                                    270 // Landscape: Rotate -90 (CW)
-                                } else {
-                                    0   // Portrait: No rotation
-                                }
-                            } else {
-                                // Back Camera
-                                if (displayRotation == 90 || displayRotation == 270) {
-                                    270 // Landscape: Rotate -90 (CW)
-                                } else {
-                                    0   // Portrait: No rotation (User reported 90 was causing 90deg CW rotation)
-                                }
-                            }
-
-                            if (frameCount % 30 == 0L) {
-                                android.util.Log.d("BbRtmpPlugin", "=== 旋转角度计算 ===")
-                                android.util.Log.d("BbRtmpPlugin", "sensorOrientation: ${sensorOrientation}°")
-                                android.util.Log.d("BbRtmpPlugin", "displayRotation: ${displayRotation}°")
-                                android.util.Log.d("BbRtmpPlugin", "isFrontCamera: $isFront")
-                                android.util.Log.d("BbRtmpPlugin", "isInputContentPortrait: $isInputContentPortrait")
-                                android.util.Log.d("BbRtmpPlugin", "finalRotation: ${rotation}°")
-                            }
-                        } else {
-                            android.util.Log.w("BbRtmpPlugin", "cameraController 为空，使用默认旋转 0°")
-                        }
-                        
-                        // 使用 FBO 渲染：先渲染到 FBO，然后输出到编码器和预览 Surface（只渲染一次，性能更好）
-                        renderer.renderFrame(
-                            cameraTexture = cameraTextureId,
-                            stMatrix = transformMatrix,
-                            videoWidth = glCameraWidth,
-                            videoHeight = glCameraHeight,
-                            mode = GlRenderer.ScaleMode.FIT,
-                            extraRotation = rotation,
-                            isInputContentPortrait = isInputContentPortrait,
-                            timestampNs = finalTimestampNs
-                        )
-                        
-                        frameCount++
-                        
-                        val currentTime = System.currentTimeMillis()
-                        
-                        // 每 1 秒打印一次日志
-                        if (currentTime - lastLogTime >= 1000) {
-                            android.util.Log.d("BbRtmpPlugin", "FBO 渲染: 帧数=$frameCount, 错误=$errorCount, swapBuffers成功")
-                            lastLogTime = currentTime
-                            frameCount = 0
-                        }
-                    } catch (e: Exception) {
-                        errorCount++
-                        if (errorCount % 30 == 0L) {
-                            android.util.Log.e("BbRtmpPlugin", "渲染失败 (已失败 $errorCount 次)", e)
-                        }
-                        // 继续运行，不中断
-                    }
-                    
-                    // 控制帧率（30fps），避免时间戳倒退
-                    // 虽然不使用 Thread.sleep，但需要确保不会过快渲染导致时间戳问题
-                    val frameTime = System.currentTimeMillis() - frameStartTime
-                    val targetFrameTime = 1000L / 30  // 30fps
-                    val sleepTime = targetFrameTime - frameTime
-                    if (sleepTime > 0) {
-                        // 使用短暂的 sleep 来控制帧率，避免时间戳倒退
-                        Thread.sleep(sleepTime)
-                    }
-                } catch (e: Exception) {
-                    errorCount++
-                    android.util.Log.e("BbRtmpPlugin", "FBO 渲染循环异常 (已失败 $errorCount 次)", e)
-                    // 继续运行，不中断
-                }
-            }
-            
-            // 清理纹理（如果循环正常结束）
-            if (cameraTextureId != 0) {
-                try {
-                    // 释放纹理（在 EGL 上下文中）
-                    // 注意：需要先检查 SurfaceTexture 是否有效，避免在已废弃的 SurfaceTexture 上调用 detachFromGLContext
-                    try {
-                        if (!inputSurfaceTexture.isReleased) {
-                            inputSurfaceTexture.detachFromGLContext()
-                        }
-                        android.opengl.GLES20.glDeleteTextures(1, intArrayOf(cameraTextureId), 0)
-                    } catch (e: Exception) {
-                        android.util.Log.w("BbRtmpPlugin", "释放纹理失败", e)
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.e("BbRtmpPlugin", "清理摄像头纹理失败", e)
-                }
-                cameraTextureId = 0
-            }
-            
-            // 释放预览 Surface
-            try {
-                previewSurface?.release()
-            } catch (e: Exception) {
-                android.util.Log.w("BbRtmpPlugin", "释放预览 Surface 失败", e)
-            }
-            
-            // 释放 GlRenderer（在 EGL 上下文中）
-            try {
-                glRenderer?.release()
-                glRenderer = null
-                android.util.Log.d("BbRtmpPlugin", "GlRenderer 已释放")
-            } catch (e: Exception) {
-                android.util.Log.w("BbRtmpPlugin", "释放 GlRenderer 失败", e)
-            }
-            
-            android.util.Log.d("BbRtmpPlugin", "FBO 渲染循环已停止，总帧数: $frameCount")
-        }
-    }
-
-    private fun release() {
-        try {
-            // 停止 FBO 渲染循环
-            stopFboRenderLoop()
-            
-            // Stop Foreground Service
-            context?.let { ctx ->
-                val intent = android.content.Intent(ctx, RtmpService::class.java)
-                ctx.stopService(intent)
-            }
-            
-            bitrateController?.release()
-            rtmpStreamer?.release()
-            videoEncoder?.release()
-            audioEncoder?.release()
-            cameraController?.closeCamera()
-
-            textureEntry?.release()
-
-            bitrateController = null
-            rtmpStreamer = null
-            videoEncoder = null
-            audioEncoder = null
-            cameraController = null
-            textureEntry = null
-            streamWidth = 0
-            streamHeight = 0
-        } catch (e: Exception) {
-            // 忽略释放错误
-        }
-    }
 }
-
