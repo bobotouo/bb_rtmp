@@ -650,6 +650,7 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     
                     rtmpStreamer?.start()
                     bitrateController?.start()
+                    audioEncoder?.start()
                     
                     context?.let { ctx ->
                         val intent = android.content.Intent(ctx, RtmpService::class.java)
@@ -718,6 +719,8 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             
             glRenderer?.release()
             glRenderer = null
+            
+            audioEncoder?.stop()
         } catch (e: Exception) {
             android.util.Log.e("BbRtmpPlugin", "stopPreview failed", e)
         }
@@ -728,6 +731,7 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             // 1. 先停止推流和码率控制
             rtmpStreamer?.stop()
             bitrateController?.stop()
+            audioEncoder?.stop()
             
             // 2. 停止服务
             context?.let { ctx ->

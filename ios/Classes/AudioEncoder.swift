@@ -101,20 +101,51 @@ class AudioEncoder {
             &bitrateValue
         )
         
+        return start()
+    }
+    
+    /**
+     * Start audio engine and recording
+     */
+    func start() -> Bool {
+        guard let engine = audioEngine else { return false }
+        if engine.isRunning { return true }
+        
+        let inputNode = engine.inputNode
+        let nodeInputFormat = inputNode.outputFormat(forBus: 0)
+        
+        // Remove tap first just in case
+        inputNode.removeTap(onBus: 0)
+        
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: nodeInputFormat) { [weak self] (buffer, time) in
             self?.encodeAudioBuffer(buffer: buffer, time: time)
         }
         
         do {
+            try engine.prepare()
             try engine.start()
             isEncoding = true
-            print("[\(tag)] Audio encoder initialized: sampleRate=\(sampleRate), bitrate=\(bitrate)")
+            print("[\(tag)] Audio engine started")
             return true
         } catch {
             print("[\(tag)] Failed to start audio engine: \(error)")
             callback?.onError(error: "Failed to start audio engine")
             return false
         }
+    }
+    
+    /**
+     * Stop audio engine and recording
+     */
+    func stop() {
+        isEncoding = false
+        if let engine = audioEngine {
+            if engine.isRunning {
+                engine.stop()
+            }
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        print("[\(tag)] Audio engine stopped")
     }
     
     /**
@@ -194,15 +225,20 @@ class AudioEncoder {
      * Release encoder
      */
     func release() {
-        isEncoding = false
-        
-        audioEngine?.stop()
-        audioEngine?.inputNode.removeTap(onBus: 0)
+        stop()
         audioEngine = nil
         
         if let converter = audioConverter {
             AudioConverterDispose(converter)
             audioConverter = nil
+        }
+        
+        // Deactivate audio session to release hardware
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("[\(tag)] Failed to deactivate AVAudioSession: \(error)")
         }
         
         print("[\(tag)] Audio encoder released")

@@ -56,6 +56,7 @@ static bool send_packet(Connection &conn, RTMPPacket *packet) {
         conn.bytes_sent += packet->m_nBodySize;
         return true;
     }
+    LOGE("RTMP_SendPacket 失败: type=%d, size=%d, channel=%d", packet->m_packetType, packet->m_nBodySize, packet->m_nChannel);
     return false;
 }
 
@@ -426,13 +427,17 @@ static bool send_aac_sequence_header(Connection &conn) {
     packet.m_nBodySize = idx;
     packet.m_packetType = RTMP_PACKET_TYPE_AUDIO;
     packet.m_nChannel = 0x04;
-    packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+    packet.m_headerType = RTMP_PACKET_SIZE_LARGE;
     packet.m_nTimeStamp = 0;
     packet.m_hasAbsTimestamp = 1;
 
     bool ok = send_packet(conn, &packet);
     RTMPPacket_Free(&packet);
-    if (ok) conn.sent_audio_config = true;
+    if (ok) {
+        conn.sent_audio_config = true;
+    } else {
+        LOGE("发送 AAC sequence header 失败");
+    }
     return ok;
 }
 
@@ -464,12 +469,15 @@ static bool send_aac_frame(Connection &conn, const uint8_t *data, int size, uint
     packet.m_nBodySize = idx;
     packet.m_packetType = RTMP_PACKET_TYPE_AUDIO;
     packet.m_nChannel = 0x04;
-    packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+    packet.m_headerType = RTMP_PACKET_SIZE_LARGE;
     packet.m_nTimeStamp = timestamp_ms;
     packet.m_hasAbsTimestamp = 1;
 
     bool ok = send_packet(conn, &packet);
     RTMPPacket_Free(&packet);
+    if (!ok) {
+        LOGE("发送 AAC 帧失败: timestamp=%u, size=%d", timestamp_ms, size);
+    }
     return ok;
 }
 
@@ -490,8 +498,8 @@ rtmp_handle_t rtmp_init(const char *url) {
     RTMP_Init(rtmp);
     
     // 设置缓冲区和超时
-    RTMP_SetBufferMS(rtmp, 500); // 500ms 缓冲区，避免延迟累积
-    rtmp->Link.timeout = 5; // 5 秒连接超时
+    RTMP_SetBufferMS(rtmp, 10000); // 10 秒缓冲区
+    rtmp->Link.timeout = 10; // 10 秒连接超时
     
     char *url_copy = strdup(url);
     LOGD("调用 RTMP_SetupURL");
@@ -526,54 +534,17 @@ rtmp_handle_t rtmp_init(const char *url) {
     }
     
     LOGD("RTMP_Connect 成功，尝试连接流...");
-    // 设置 socket 接收超时（确保每次读取都有超时限制）
+    
+    // 设置连接和发送/接收超时
+    rtmp->Link.timeout = 10;
     struct timeval tv;
-    tv.tv_sec = 5;
+    tv.tv_sec = 10;
     tv.tv_usec = 0;
-    if (setsockopt(rtmp->m_sb.sb_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) != 0) {
-        LOGE("设置 socket 接收超时失败");
-    }
-    
-    // 实现带超时的 RTMP_ConnectStream（因为原版可能会一直等待）
-    RTMPPacket packet = { 0 };
-    rtmp->m_mediaChannel = 0;
-    
-    while (!rtmp->m_bPlaying && RTMP_IsConnected(rtmp)) {
-        if (!RTMP_ReadPacket(rtmp, &packet)) {
-            // 读取失败，检查是否超时
-            if (RTMP_IsTimedout(rtmp)) {
-                LOGE("RTMP_ConnectStream 超时");
-                RTMPPacket_Free(&packet);
-                RTMP_Close(rtmp);
-                RTMP_Free(rtmp);
-                return 0;
-            }
-            // 其他错误，退出循环
-            break;
-        }
-        
-        if (RTMPPacket_IsReady(&packet)) {
-            if (!packet.m_nBodySize) {
-                continue;
-            }
-            if ((packet.m_packetType == RTMP_PACKET_TYPE_AUDIO) ||
-                (packet.m_packetType == RTMP_PACKET_TYPE_VIDEO) ||
-                (packet.m_packetType == RTMP_PACKET_TYPE_INFO)) {
-                RTMPPacket_Free(&packet);
-                continue;
-            }
-            
-            RTMP_ClientPacket(rtmp, &packet);
-            RTMPPacket_Free(&packet);
-        }
-    }
-    
-    if (!rtmp->m_bPlaying) {
+    setsockopt(rtmp->m_sb.sb_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+    setsockopt(rtmp->m_sb.sb_socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv));
+
+    if (!RTMP_ConnectStream(rtmp, 0)) {
         LOGE("RTMP_ConnectStream 失败，无法连接到流: %s", url);
-        LOGE("  可能原因: 1) 流路径不正确 2) 服务器拒绝推流 3) 需要认证");
-        LOGE("  请检查: app=%.*s, playpath=%.*s", 
-             rtmp->Link.app.av_len, rtmp->Link.app.av_val,
-             rtmp->Link.playpath.av_len, rtmp->Link.playpath.av_val);
         RTMP_Close(rtmp);
         RTMP_Free(rtmp);
         return 0;

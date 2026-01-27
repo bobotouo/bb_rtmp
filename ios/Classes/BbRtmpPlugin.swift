@@ -274,7 +274,7 @@ import Accelerate
         
         if connection.isVideoOrientationSupported {
             // 使用 portraitUpsideDown 和 landscapeRight 来修正预览方向
-            // 虽然看起来怪异，但方向是正确的
+            // ciimage 与 cvpixelbuffer 的坐标系 不同, 这里翻转一下
             if isPortrait {
                 connection.videoOrientation = .portraitUpsideDown
             } else {
@@ -434,6 +434,7 @@ import Accelerate
             
             self.rtmpStreamer?.start()
             self.bitrateController?.start()
+            _ = self.audioEncoder?.start()
             
             // 发送连接成功状态
             self.notifyStreamingStatus(status: "connected", error: nil)
@@ -459,6 +460,7 @@ import Accelerate
     private func stopStreaming(result: @escaping FlutterResult) {
         rtmpStreamer?.stop()
         bitrateController?.stop()
+        audioEncoder?.stop()
         notifyStreamingStatus(status: "stopped", error: nil)
         result(nil)
     }
@@ -484,6 +486,8 @@ import Accelerate
             session.commitConfiguration()
         }
         captureSession = nil
+        
+        audioEncoder?.stop()
         
         previewTexture?.release()
         previewTexture = nil

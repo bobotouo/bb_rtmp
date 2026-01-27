@@ -326,7 +326,7 @@ rtmp_handle_t rtmp_init(const char *url) {
     RTMP *rtmp = RTMP_Alloc();
     if (!rtmp) { free(url_copy); return 0; }
     RTMP_Init(rtmp);
-    RTMP_SetBufferMS(rtmp, 3000); // 3 秒缓冲区，平衡稳定性与延迟
+    RTMP_SetBufferMS(rtmp, 10000); // 10 秒缓冲区
     rtmp->Link.timeout = 10;
     if (!RTMP_SetupURL(rtmp, url_copy)) { RTMP_Free(rtmp); free(url_copy); return 0; }
     RTMP_EnableWrite(rtmp);

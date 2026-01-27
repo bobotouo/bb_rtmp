@@ -70,14 +70,7 @@ class AudioEncoder {
             }
 
             this.audioRecord = audioRecord
-            isEncoding.set(true)
-
-            // 启动录音和编码线程
-            recordThread = Thread {
-                recordAndEncode()
-            }
-            recordThread?.start()
-
+            
             Log.d(TAG, "音频编码器初始化成功: sampleRate=$sampleRate, bitrate=$bitrate")
             return true
         } catch (e: Exception) {
@@ -141,15 +134,20 @@ class AudioEncoder {
                             outputBuffer.position(bufferInfo.offset)
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                             
-                            // 创建只读副本
-                            val data = outputBuffer.slice()
-                            // 安全调用回调（检查回调是否仍然有效）
-                            val callback = encoderCallback
-                            if (callback != null) {
-                                try {
-                                    callback.onEncodedData(data, bufferInfo)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "编码数据回调异常（可能已释放）", e)
+                            // 检查是否为配置统计信息包 (ASC)，RTMP 协议单独处理它，不应该作为数据包发送
+                            if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                Log.d(TAG, "跳过音频配置帧 (Codec Config), size=${bufferInfo.size}")
+                            } else {
+                                // 创建只读副本
+                                val data = outputBuffer.slice()
+                                // 安全调用回调（检查回调是否仍然有效）
+                                val callback = encoderCallback
+                                if (callback != null) {
+                                    try {
+                                        callback.onEncodedData(data, bufferInfo)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "编码数据回调异常（可能已释放）", e)
+                                    }
                                 }
                             }
                         }
@@ -170,6 +168,43 @@ class AudioEncoder {
         } catch (e: Exception) {
             Log.e(TAG, "停止录音失败", e)
         }
+        Log.d(TAG, "录音线程已退出")
+    }
+
+    /**
+     * 开始录音和编码
+     */
+    fun start(): Boolean {
+        if (isEncoding.get()) return true
+        
+        if (audioRecord == null || mediaCodec == null) {
+            Log.e(TAG, "尚未初始化，无法开始录音")
+            return false
+        }
+
+        isEncoding.set(true)
+        recordThread = Thread {
+            recordAndEncode()
+        }
+        recordThread?.start()
+        Log.d(TAG, "音频录制已开始")
+        return true
+    }
+
+    /**
+     * 停止录音和编码
+     */
+    fun stop() {
+        if (!isEncoding.get()) return
+        
+        isEncoding.set(false)
+        try {
+            recordThread?.join(1000)
+            recordThread = null
+        } catch (e: Exception) {
+            Log.e(TAG, "等待录音线程结束失败", e)
+        }
+        Log.d(TAG, "音频录制已停止")
     }
 
     /**
