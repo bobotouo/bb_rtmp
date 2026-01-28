@@ -23,9 +23,10 @@ class GlRenderer {
     private var eglEncoderSurface: EGLSurface? = null  // 编码器 Surface（主要的 EGLSurface）
     private var eglPreviewSurface: EGLSurface? = null  // 预览 Surface（临时的 EGLSurface，用于将 FBO texture 渲染到 previewSurfaceTexture）
     
-    // FBO 相关
-    private var fboTextureId = 0  // FBO 纹理 ID
-    private var fboFrameBuffer = 0  // FBO Frame Buffer Object
+    // FBO 相关 (双缓冲)
+    private val fboTextureIds = IntArray(2)  // FBO 纹理 IDs
+    private val fboFrameBuffers = IntArray(2)  // FBO Frame Buffer Objects
+    private var currentFboIndex = 0  // 当前使用的 FBO 索引 (Ping-Pong)
     private var fboProgramHandle = 0  // 用于从 FBO 读取的 Shader Program
     
     private var programHandle = 0
@@ -47,7 +48,7 @@ class GlRenderer {
 
     private val fragmentShaderCode = """
         #extension GL_OES_EGL_image_external : require
-        precision mediump float;
+        precision highp float;
         varying vec2 vTexCoord;
         uniform samplerExternalOES uTexture;
         uniform mat4 uTextureTransform;
@@ -147,28 +148,25 @@ class GlRenderer {
             put(texCoords); position(0)
         }
         
-        // 创建 FBO 纹理和 Frame Buffer
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        fboTextureId = textures[0]
-        
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureId)
-        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, canvasWidth, canvasHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        
-        val framebuffers = IntArray(1)
-        GLES20.glGenFramebuffers(1, framebuffers, 0)
-        fboFrameBuffer = framebuffers[0]
-        
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffer)
-        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, fboTextureId, 0)
-        
-        val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
-        if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-            throw RuntimeException("FBO 初始化失败: $status")
+        // 创建 FBO 纹理和 Frame Buffer (双缓冲)
+        GLES20.glGenTextures(2, fboTextureIds, 0)
+        GLES20.glGenFramebuffers(2, fboFrameBuffers, 0)
+
+        for (i in 0 until 2) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureIds[i])
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, canvasWidth, canvasHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffers[i])
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, fboTextureIds[i], 0)
+
+            val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                throw RuntimeException("FBO [$i] 初始化失败: $status")
+            }
         }
         
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -216,8 +214,11 @@ class GlRenderer {
      * @param readTarget 若需读像素：传入 capacity>=width*height*4 的 DirectByteBuffer，在渲染完成后、解绑 FBO 前立即读取
      */
     fun drawFrameToFbo(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int = 0, isInputContentPortrait: Boolean = false, readTarget: ByteBuffer? = null) {
-        // 绑定到 FBO
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffer)
+        // 切换 FBO (Ping-Pong)
+        currentFboIndex = (currentFboIndex + 1) % 2
+        
+        // 绑定到当前 FBO
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffers[currentFboIndex])
         GLES20.glViewport(0, 0, canvasWidth, canvasHeight)
         
         GLES20.glUseProgram(programHandle)
@@ -297,32 +298,24 @@ class GlRenderer {
         // 在解绑 FBO 之前读取像素（渲染完成的最可靠时机）
         val readSize = canvasWidth * canvasHeight * 4
         if (readTarget != null && readTarget.capacity() >= readSize) {
-            readTarget.clear()
-            GLES20.glFinish()
-            GLES20.glReadPixels(0, 0, canvasWidth, canvasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readTarget)
-            
-            // 翻转数据：glReadPixels 读取的数据是上下翻转的（OpenGL 坐标系左下角为原点）
-            // 我们需要翻转，使其符合标准图像坐标系（左上角为原点）
-            val rowSize = canvasWidth * 4
-            val tempRow = ByteArray(rowSize)
-            val bufferArray = ByteArray(readSize)
             readTarget.rewind()
-            readTarget.get(bufferArray)
-            
-            // 翻转行：从下往上读取，从上往下写入
-            for (y in 0 until canvasHeight / 2) {
-                val topRowIndex = y * rowSize
-                val bottomRowIndex = (canvasHeight - 1 - y) * rowSize
-                
-                // 交换两行
-                System.arraycopy(bufferArray, topRowIndex, tempRow, 0, rowSize)
-                System.arraycopy(bufferArray, bottomRowIndex, bufferArray, topRowIndex, rowSize)
-                System.arraycopy(tempRow, 0, bufferArray, bottomRowIndex, rowSize)
+            GLES20.glReadPixels(0, 0, canvasWidth, canvasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readTarget)
+            readTarget.rewind()
+            // glReadPixels 为底行在前（OpenGL 坐标系），翻转为顶行在前，使发给 AI 的帧与预览一致，识别效果正常
+            val rowBytes = canvasWidth * 4
+            val tmpI = ByteArray(rowBytes)
+            val tmpJ = ByteArray(rowBytes)
+            for (i in 0 until canvasHeight / 2) {
+                val j = canvasHeight - 1 - i
+                readTarget.position(i * rowBytes)
+                readTarget.get(tmpI)
+                readTarget.position(j * rowBytes)
+                readTarget.get(tmpJ)
+                readTarget.position(i * rowBytes)
+                readTarget.put(tmpJ)
+                readTarget.position(j * rowBytes)
+                readTarget.put(tmpI)
             }
-            
-            // 将翻转后的数据写回 buffer
-            readTarget.clear()
-            readTarget.put(bufferArray)
             readTarget.rewind()
         }
         
@@ -333,12 +326,12 @@ class GlRenderer {
     /**
      * 从 FBO 读取并渲染到当前绑定的 Surface
      */
-    private fun drawFboToSurface() {
+    private fun drawFboToSurface(viewportWidth: Int, viewportHeight: Int) {
         GLES20.glUseProgram(fboProgramHandle)
-        GLES20.glViewport(0, 0, canvasWidth, canvasHeight)
+        GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
         
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureId)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTextureIds[currentFboIndex])
         GLES20.glUniform1i(fboTextureHandle, 0)
         
         GLES20.glEnableVertexAttribArray(fboPositionHandle)
@@ -362,38 +355,30 @@ class GlRenderer {
      * @param mode 缩放模式
      * @param extraRotation 额外旋转角度
      * @param timestampNs 时间戳（纳秒）
+     * @param previewWidth 预览 Surface 实际宽度（0 表示使用 canvasWidth）
+     * @param previewHeight 预览 Surface 实际高度（0 表示使用 canvasHeight）
      */
-    /**
-     * 渲染一帧：渲染到 FBO，然后输出到编码器 Surface
-     * Preview 通过 SurfaceTexture 直接消费 FBO texture（在 BbRtmpPlugin 中处理）
-     * @param cameraTexture 相机纹理 ID
-     * @param stMatrix SurfaceTexture 变换矩阵
-     * @param videoWidth 视频宽度
-     * @param videoHeight 视频高度
-     * @param mode 缩放模式
-     * @param extraRotation 额外旋转角度（由 sensorOrientation + displayRotation 计算得出）
-     * @param isInputContentPortrait 输入内容是否为竖屏
-     * @param timestampNs 时间戳（纳秒）
-     */
-    /**
-     * @param fboReadTarget 若需读像素给 YOLO：传入 capacity>=width*height*4 的 DirectByteBuffer，
-     *                     在 drawFrameToFbo 内渲染完成后、解绑 FBO 前立即读取（最可靠）
-     */
-    fun renderFrame(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int, isInputContentPortrait: Boolean, timestampNs: Long, fboReadTarget: ByteBuffer? = null) {
+    fun renderFrame(cameraTexture: Int, stMatrix: FloatArray, videoWidth: Int, videoHeight: Int, mode: ScaleMode, extraRotation: Int, isInputContentPortrait: Boolean, timestampNs: Long, fboReadTarget: ByteBuffer? = null, previewWidth: Int = 0, previewHeight: Int = 0) {
         // 1. 渲染到 FBO，并在渲染完成后立即读取像素（若需要）
         drawFrameToFbo(cameraTexture, stMatrix, videoWidth, videoHeight, mode, extraRotation, isInputContentPortrait, fboReadTarget)
 
-        // 2. 输出到编码器 Surface
+        // 2. 输出到编码器 Surface (始终使用 FBO 大小 = 标准横屏分辨率)
         if (eglEncoderSurface != null) {
-            drawFboToSurface()
+            drawFboToSurface(canvasWidth, canvasHeight)
             EGLExt.eglPresentationTimeANDROID(eglDisplay, eglEncoderSurface, timestampNs)
             EGL14.eglSwapBuffers(eglDisplay, eglEncoderSurface)
         }
 
-        // 3. 输出到预览 Surface
+        // 3. 输出到预览 Surface (使用实际 Surface 大小, 以支持全屏铺满)
         if (eglPreviewSurface != null) {
             EGL14.eglMakeCurrent(eglDisplay, eglPreviewSurface, eglPreviewSurface, eglContext)
-            drawFboToSurface()
+            
+            val targetW = if (previewWidth > 0) previewWidth else canvasWidth
+            val targetH = if (previewHeight > 0) previewHeight else canvasHeight
+            
+            drawFboToSurface(targetW, targetH)
+            
+            // 移除 glFinish()，使用双缓冲解决撕裂
             EGL14.eglSwapBuffers(eglDisplay, eglPreviewSurface)
             EGL14.eglMakeCurrent(eglDisplay, eglEncoderSurface, eglEncoderSurface, eglContext)
         }
@@ -402,7 +387,7 @@ class GlRenderer {
     /**
      * 获取 FBO texture ID（用于预览渲染）
      */
-    fun getFboTextureId(): Int = fboTextureId
+    fun getFboTextureId(): Int = fboTextureIds[currentFboIndex]
     
     /**
      * 从 FBO 读取 RGBA 像素数据（用于 YOLO 检测）
@@ -413,7 +398,7 @@ class GlRenderer {
      * 我们在这里翻转数据，使其返回正确方向的图像（标准图像坐标系，左上角为原点）
      */
     fun readFboRgba(targetBuffer: ByteBuffer? = null): ByteBuffer? {
-        if (fboFrameBuffer == 0 || canvasWidth <= 0 || canvasHeight <= 0) {
+        if (fboFrameBuffers[0] == 0 || canvasWidth <= 0 || canvasHeight <= 0) {
             return null
         }
         val bufferSize = canvasWidth * canvasHeight * 4
@@ -425,48 +410,23 @@ class GlRenderer {
             ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder())
         }
 
-        // 确保绑定到 FBO（在 renderFrame 中，FBO 已经解绑，需要重新绑定）
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffer)
-        // 确保 GPU 已完成渲染到 FBO，再读取，避免读到未完成或全黑帧
-        GLES20.glFinish()
+        // 确保绑定到当前 FBO
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboFrameBuffers[currentFboIndex])
 
         // 从 FBO 读取像素数据（RGBA 格式）
-        // 注意：glReadPixels 从当前绑定的 framebuffer 读取，坐标系是左下角为原点
+        buffer.rewind()
         GLES20.glReadPixels(0, 0, canvasWidth, canvasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
 
         val error = GLES20.glGetError()
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+
         if (error != GLES20.GL_NO_ERROR) {
-            android.util.Log.e(TAG, "glReadPixels 错误: $error")
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            android.util.Log.e(TAG, "glReadPixels error: $error")
             return null
         }
 
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-        
-        // 翻转数据：glReadPixels 读取的数据是上下翻转的（OpenGL 坐标系左下角为原点）
-        // 我们需要翻转，使其符合标准图像坐标系（左上角为原点）
-        val rowSize = canvasWidth * 4
-        val tempRow = ByteArray(rowSize)
-        val bufferArray = ByteArray(bufferSize)
+        // 为了性能，移除 CPU 翻转。如果检测算法需要，可以在应用侧翻转坐标轴。
         buffer.rewind()
-        buffer.get(bufferArray)
-        
-        // 翻转行：从下往上读取，从上往下写入
-        for (y in 0 until canvasHeight / 2) {
-            val topRowIndex = y * rowSize
-            val bottomRowIndex = (canvasHeight - 1 - y) * rowSize
-            
-            // 交换两行
-            System.arraycopy(bufferArray, topRowIndex, tempRow, 0, rowSize)
-            System.arraycopy(bufferArray, bottomRowIndex, bufferArray, topRowIndex, rowSize)
-            System.arraycopy(tempRow, 0, bufferArray, bottomRowIndex, rowSize)
-        }
-        
-        // 将翻转后的数据写回 buffer
-        buffer.clear()
-        buffer.put(bufferArray)
-        buffer.rewind()
-        
         return buffer
     }
 
@@ -481,13 +441,16 @@ class GlRenderer {
         EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         
         // 释放 FBO
-        if (fboTextureId != 0) {
-            GLES20.glDeleteTextures(1, intArrayOf(fboTextureId), 0)
-            fboTextureId = 0
+        // 释放 FBO
+        if (fboTextureIds[0] != 0) {
+            GLES20.glDeleteTextures(2, fboTextureIds, 0)
+            fboTextureIds[0] = 0
+            fboTextureIds[1] = 0
         }
-        if (fboFrameBuffer != 0) {
-            GLES20.glDeleteFramebuffers(1, intArrayOf(fboFrameBuffer), 0)
-            fboFrameBuffer = 0
+        if (fboFrameBuffers[0] != 0) {
+            GLES20.glDeleteFramebuffers(2, fboFrameBuffers, 0)
+            fboFrameBuffers[0] = 0
+            fboFrameBuffers[1] = 0
         }
         
         eglEncoderSurface?.let { EGL14.eglDestroySurface(eglDisplay, it) }
