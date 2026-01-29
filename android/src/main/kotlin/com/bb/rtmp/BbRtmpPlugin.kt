@@ -76,8 +76,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
     @Volatile
     private var isFboRenderLoopRunning = false
     private var fboRenderJob: kotlinx.coroutines.Job? = null
-    /** 调试用：推流开始后每 10s 高↔低分辨率切换，观察正常后删除 */
-    private var debugResolutionSwitchJob: kotlinx.coroutines.Job? = null
     // 时间戳管理（用于确保时间戳递增，避免编码器丢帧）
     private var lastTimestampNs: Long = 0
     
@@ -735,7 +733,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     rtmpStreamer?.start()
                     bitrateController?.start()
                     audioEncoder?.start()
-                    startDebugResolutionSwitchLoop()
                     
                     context?.let { ctx ->
                         val intent = android.content.Intent(ctx, RtmpService::class.java)
@@ -758,22 +755,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         }
     }
     
-    /**
-     * 调试用：推流开始后每 30s 在高(720p)与低(480p)分辨率间切换，观察正常后删除本方法及 debugResolutionSwitchJob、startDebugResolutionSwitchLoop 调用
-     */
-    private fun startDebugResolutionSwitchLoop() {
-        debugResolutionSwitchJob?.cancel()
-        debugResolutionSwitchJob = scope.launch(Dispatchers.Main) {
-            while (rtmpStreamer?.isStreaming() == true) {
-                kotlinx.coroutines.delay(30000)
-                if (rtmpStreamer?.isStreaming() != true) break
-                val (w, h) = if (glFboCanvasHeight <= 480) 1280 to 720 else 854 to 480
-                android.util.Log.i("BbRtmpPlugin", "[DEBUG] 每30s切换分辨率: ${w}x${h}")
-                doHotResolutionSwitch(w, h)
-            }
-        }
-    }
-
     /**
      * 通知推流状态变化
      */
@@ -829,8 +810,6 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
 
     private fun stopStreaming(result: Result) {
         try {
-            debugResolutionSwitchJob?.cancel()
-            debugResolutionSwitchJob = null
             // 1. 先停止推流和码率控制
             rtmpStreamer?.stop()
             bitrateController?.stop()
