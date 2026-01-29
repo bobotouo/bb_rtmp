@@ -28,6 +28,45 @@ class VideoEncoder {
     // 静态计数器用于日志（避免日志过多）
     private var staticOutputFrameCount = 0
     private var staticEmptyFrameCount = 0
+    
+    // FPS 统计
+    private val fpsStats = FpsStats()
+    
+    /**
+     * FPS 统计类
+     */
+    private class FpsStats {
+        private val frameTimestamps = mutableListOf<Long>()
+        private val maxSamples = 60 // 保留最近60帧的时间戳
+        private val lock = Any()
+        
+        fun recordFrame() {
+            synchronized(lock) {
+                val now = System.currentTimeMillis()
+                frameTimestamps.add(now)
+                // 只保留最近1秒内的帧
+                val oneSecondAgo = now - 1000
+                frameTimestamps.removeAll { it < oneSecondAgo }
+            }
+        }
+        
+        fun getFps(): Float {
+            synchronized(lock) {
+                if (frameTimestamps.size < 2) return 0f
+                val oldest = frameTimestamps.first()
+                val newest = frameTimestamps.last()
+                val duration = (newest - oldest).toFloat() / 1000f // 秒
+                if (duration <= 0) return 0f
+                return (frameTimestamps.size - 1) / duration
+            }
+        }
+        
+        fun reset() {
+            synchronized(lock) {
+                frameTimestamps.clear()
+            }
+        }
+    }
 
     interface EncoderCallback {
         fun onEncodedData(data: ByteBuffer, info: MediaCodec.BufferInfo)
@@ -61,8 +100,8 @@ class VideoEncoder {
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            // GOP (关键帧间隔) 2 秒，符合抖音、TikTok、视频号等主流平台标准
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // 480p 时缩短 GOP（1 秒）减少关键帧尖峰，与 iOS 一致；其他分辨率 2 秒
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, if (height == 480) 1 else 2)
             format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
 
             val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -176,6 +215,9 @@ class VideoEncoder {
                     outputBufferId >= 0 -> {
                         val outputBuffer = codec.getOutputBuffer(outputBufferId)
                         if (outputBuffer != null && bufferInfo.size > 0) {
+                            // 记录帧统计
+                            fpsStats.recordFrame()
+                            
                             // 零拷贝：直接传递 ByteBuffer 给回调
                             outputBuffer.position(bufferInfo.offset)
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
@@ -304,6 +346,7 @@ class VideoEncoder {
                 savedSps = null
                 savedPps = null
             }
+            fpsStats.reset()
             Log.d(TAG, "视频编码器已释放")
         } catch (e: Exception) {
             Log.e(TAG, "释放视频编码器失败", e)
@@ -314,6 +357,11 @@ class VideoEncoder {
      * 获取当前码率
      */
     fun getCurrentBitrate(): Int = bitrate
+    
+    /**
+     * 获取当前编码帧率（FPS）
+     */
+    fun getCurrentFps(): Float = fpsStats.getFps()
 
     /**
      * 获取编码器 Surface（用于摄像头输入）

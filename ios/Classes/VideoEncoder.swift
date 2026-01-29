@@ -21,6 +21,49 @@ class VideoEncoder {
     private var outputFrameCount = 0
     private var emptyFrameCount = 0
     
+    // FPS statistics
+    private var fpsStats = FpsStats()
+    
+    /**
+     * FPS statistics class
+     */
+    private class FpsStats {
+        private var frameTimestamps: [Int64] = []
+        private let maxSamples = 60 // Keep timestamps of last 60 frames
+        private let lock = NSLock()
+        
+        func recordFrame() {
+            lock.lock()
+            defer { lock.unlock() }
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            frameTimestamps.append(now)
+            // Only keep frames within last 1 second
+            let oneSecondAgo = now - 1000
+            frameTimestamps.removeAll { $0 < oneSecondAgo }
+        }
+        
+        func getFps() -> Float {
+            lock.lock()
+            defer { lock.unlock() }
+            if frameTimestamps.count < 2 {
+                return 0.0
+            }
+            let oldest = frameTimestamps.first!
+            let newest = frameTimestamps.last!
+            let duration = Float(newest - oldest) / 1000.0 // seconds
+            if duration <= 0 {
+                return 0.0
+            }
+            return Float(frameTimestamps.count - 1) / duration
+        }
+        
+        func reset() {
+            lock.lock()
+            defer { lock.unlock() }
+            frameTimestamps.removeAll()
+        }
+    }
+    
     protocol EncoderCallback {
         func onEncodedData(data: Data, info: BufferInfo, isKeyFrame: Bool)
         func onCodecConfig(sps: Data, pps: Data)
@@ -84,11 +127,18 @@ class VideoEncoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 2) as CFNumber) // GOP 2 seconds
+        // Low bitrate / 480p: shorter GOP 减小关键帧尖峰，拉流端少卡缓冲
+        let isLowRes = height <= 480
+        let gopFrames: Int
+        if isLowRes { gopFrames = fps / 2 }           // 480p: 0.5s GOP
+        else if bitrate <= 500_000 { gopFrames = fps * 1 }  // 1s
+        else { gopFrames = fps * 2 }                 // 2s
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         
-        // Set bitrate limit
-        let bitrateLimit = [Double(bitrate) * 1.5, 1.0] as CFArray
+        // 480p 时收紧码率峰值 (1.2x)，减少瞬时尖峰导致拉流缓冲
+        let peakMultiplier = isLowRes ? 1.2 : 1.5
+        let bitrateLimit = [Double(bitrate) * peakMultiplier, 1.0] as CFArray
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: bitrateLimit)
         
         // Prepare to encode
@@ -104,6 +154,10 @@ class VideoEncoder {
         return true
     }
     
+    // Track frame count for warmup
+    private var encodedFrameCount: Int = 0
+    private let warmupFrameCount = 10 // Skip first 10 frames to warm up encoder
+    
     /**
      * Encode a pixel buffer
      */
@@ -112,8 +166,35 @@ class VideoEncoder {
             return
         }
         
-        let presentationTime = CMTime(value: presentationTimeUs, timescale: 1_000_000)
+        // Skip first few frames to warm up encoder and avoid stutter at start
+        encodedFrameCount += 1
+        if encodedFrameCount <= warmupFrameCount {
+            // During warmup, encode but don't count towards FPS stats
+            // This allows encoder to stabilize before we start tracking performance
+        }
+        
+        // Adjust presentation time to ensure continuity after reset
+        let adjustedTimeUs: Int64
+        if resetTimeUs > 0 {
+            // After reset: use relative time from reset point (start from 0)
+            let elapsedUs = Int64(Date().timeIntervalSince1970 * 1_000_000) - resetTimeUs
+            adjustedTimeUs = max(elapsedUs, lastPresentationTimeUs + Int64(1_000_000 / fps))
+        } else {
+            // Normal case: use provided time, but ensure it's increasing
+            adjustedTimeUs = max(presentationTimeUs, lastPresentationTimeUs + Int64(1_000_000 / fps))
+        }
+        
+        lastPresentationTimeUs = adjustedTimeUs
+        
+        let presentationTime = CMTime(value: adjustedTimeUs, timescale: 1_000_000)
         let duration = CMTime(value: Int64(1_000_000 / fps), timescale: 1_000_000)
+        
+        // Log input buffer size for debugging (only occasionally to avoid spam)
+        let inputWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let inputHeight = CVPixelBufferGetHeight(pixelBuffer)
+        if encodedFrameCount % 30 == 0 {
+            print("[\(tag)] Encoding frame: input=\(inputWidth)x\(inputHeight), encoder=\(width)x\(height)")
+        }
         
         var flags: VTEncodeInfoFlags = []
         let status = VTCompressionSessionEncodeFrame(
@@ -129,14 +210,22 @@ class VideoEncoder {
         if status == -12903 {
             print("[\(tag)] Encoder not available (background?), attempting to reset session...")
             resetSession()
+            encodedFrameCount = 0 // Reset frame count after reset
         } else if status != noErr {
-            print("[\(tag)] Failed to encode frame: \(status)")
+            print("[\(tag)] Failed to encode frame: \(status), input=\(inputWidth)x\(inputHeight), encoder=\(width)x\(height)")
         }
     }
+    
+    // Track last presentation time to ensure continuity after reset
+    private var lastPresentationTimeUs: Int64 = 0
+    private var resetTimeUs: Int64 = 0
     
     private func resetSession() {
         guard isEncoding else { return }
         print("[\(tag)] Resetting VTCompressionSession...")
+        
+        // Save reset time to adjust timestamps
+        resetTimeUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
         
         // Invalidate old session
         if let session = compressionSession {
@@ -144,8 +233,16 @@ class VideoEncoder {
             compressionSession = nil
         }
         
+        // Reset FPS stats and frame count
+        fpsStats.reset()
+        encodedFrameCount = 0 // Reset frame count for warmup
+        
         // Re-initialize with saved properties
         _ = initialize(width: Int(width), height: Int(height), bitrate: bitrate, fps: fps)
+        
+        // Reset last presentation time - timestamps will restart from reset point
+        lastPresentationTimeUs = 0
+        print("[\(tag)] Encoder reset, timestamps will restart, warmup frames: \(warmupFrameCount)")
     }
     
     /**
@@ -156,11 +253,89 @@ class VideoEncoder {
         
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: newBitrate as CFNumber)
         
-        let bitrateLimit = [Double(newBitrate) * 1.5, 1.0] as CFArray
+        let isLowRes = height <= 480
+        let peakMultiplier = isLowRes ? 1.2 : 1.5
+        let bitrateLimit = [Double(newBitrate) * peakMultiplier, 1.0] as CFArray
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: bitrateLimit)
         
         self.bitrate = newBitrate
-        print("[\(tag)] Bitrate updated to: \(newBitrate)")
+        let gopFrames: Int
+        if isLowRes { gopFrames = fps / 2 }
+        else if newBitrate <= 500_000 { gopFrames = fps * 1 }
+        else { gopFrames = fps * 2 }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
+        print("[\(tag)] Bitrate updated to: \(newBitrate), GOP: \(gopFrames) frames")
+    }
+    
+    /**
+     * Update FPS (for adaptive frame rate when bitrate is at minimum)
+     */
+    func updateFps(_ newFps: Int) {
+        guard newFps > 0 && newFps <= 30 else { return }
+        guard let session = compressionSession else { return }
+        fps = newFps
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
+        // Low bitrate: shorter GOP (1s) for faster recovery in weak network
+        let gopFrames = bitrate <= 500_000 ? (fps * 1) : (fps * 2)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
+        print("[\(tag)] FPS updated to: \(fps), GOP: \(gopFrames) frames")
+    }
+    
+    /**
+     * Get current FPS setting
+     */
+    func getFps() -> Int {
+        return fps
+    }
+    
+    /**
+     * Get current resolution
+     */
+    func getResolution() -> (width: Int, height: Int) {
+        return (Int(width), Int(height))
+    }
+    
+    /**
+     * Get current SPS/PPS (for multi-encoder switch; caller uses for RTMP config)
+     */
+    func getSpsPps() -> (sps: Data?, pps: Data?) {
+        spsPpsLock.lock()
+        defer { spsPpsLock.unlock() }
+        return (savedSps, savedPps)
+    }
+    
+    /**
+     * Update resolution (requires session reset, but smoother than full restart)
+     */
+    func updateResolution(width: Int, height: Int, bitrate: Int, fps: Int) -> Bool {
+        guard isEncoding else { return false }
+        
+        print("[\(tag)] Updating encoder resolution: \(self.width)x\(self.height) -> \(width)x\(height)")
+        
+        // Save reset time
+        resetTimeUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
+        
+        // Invalidate old session
+        if let session = compressionSession {
+            VTCompressionSessionInvalidate(session)
+            compressionSession = nil
+        }
+        
+        // Reset FPS stats and frame count
+        fpsStats.reset()
+        encodedFrameCount = 0
+        lastPresentationTimeUs = 0
+        
+        // Re-initialize with new resolution
+        let success = initialize(width: width, height: height, bitrate: bitrate, fps: fps)
+        
+        if success {
+            print("[\(tag)] Encoder resolution updated successfully: \(width)x\(height)")
+        } else {
+            print("[\(tag)] Failed to update encoder resolution")
+        }
+        
+        return success
     }
     
     /**
@@ -190,6 +365,8 @@ class VideoEncoder {
         savedPps = nil
         spsPpsLock.unlock()
         
+        fpsStats.reset()
+        
         print("[\(tag)] Video encoder released")
     }
     
@@ -198,6 +375,13 @@ class VideoEncoder {
      */
     func getCurrentBitrate() -> Int {
         return bitrate
+    }
+    
+    /**
+     * Get current encoding FPS
+     */
+    func getCurrentFps() -> Float {
+        return fpsStats.getFps()
     }
     
     // MARK: - Compression Callback
@@ -261,7 +445,23 @@ class VideoEncoder {
         
         // Get presentation time
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let presentationTimeUs = Int64(CMTimeGetSeconds(presentationTime) * 1_000_000)
+        var presentationTimeUs = Int64(CMTimeGetSeconds(presentationTime) * 1_000_000)
+        
+        // Adjust timestamp if reset happened to ensure continuity
+        // After reset, use relative time from reset point (start from 0)
+        if resetTimeUs > 0 {
+            // Calculate elapsed time since reset
+            let nowUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
+            let elapsedUs = nowUs - resetTimeUs
+            
+            // Use elapsed time, but ensure it's increasing
+            presentationTimeUs = max(elapsedUs, lastPresentationTimeUs + Int64(1_000_000 / fps))
+        } else {
+            // Normal case: ensure timestamp is increasing
+            presentationTimeUs = max(presentationTimeUs, lastPresentationTimeUs + Int64(1_000_000 / fps))
+        }
+        
+        lastPresentationTimeUs = presentationTimeUs
         
         let bufferInfo = BufferInfo(
             size: annexBData.count,
@@ -269,9 +469,15 @@ class VideoEncoder {
             flags: isKeyFrame ? 1 : 0
         )
         
+        // Record frame for FPS statistics (skip warmup frames)
+        if encodedFrameCount > warmupFrameCount {
+            fpsStats.recordFrame()
+        }
+        
         outputFrameCount += 1
         if isKeyFrame || outputFrameCount % 30 == 0 {
-            print("[\(tag)] Encoded frame: size=\(annexBData.count), pts=\(presentationTimeUs), isKeyFrame=\(isKeyFrame) (total=\(outputFrameCount))")
+            let warmupInfo = encodedFrameCount <= warmupFrameCount ? " (warmup)" : ""
+            print("[\(tag)] Encoded frame: size=\(annexBData.count), pts=\(presentationTimeUs), isKeyFrame=\(isKeyFrame) (total=\(outputFrameCount)\(warmupInfo))")
         }
         
         callback.onEncodedData(data: annexBData, info: bufferInfo, isKeyFrame: isKeyFrame)

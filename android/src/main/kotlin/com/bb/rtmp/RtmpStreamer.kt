@@ -34,7 +34,7 @@ class RtmpStreamer {
         val timestamp: Long,
         val isKeyFrame: Boolean
     )
-    private val videoSendQueue = LinkedBlockingQueue<VideoFrame>(30) // 最多缓存 30 帧（约 1 秒）
+    private val videoSendQueue = LinkedBlockingQueue<VideoFrame>(5) // 限制队列避免弱网下积压导致内存爆炸（与 iOS 一致）
     private var videoSendThread: Thread? = null
     private val videoSendThreadRunning = AtomicBoolean(false)
     private val videoQueueSize = AtomicInteger(0) // 缓存队列大小，避免频繁调用 size()
@@ -52,6 +52,10 @@ class RtmpStreamer {
     // 统计信息
     private val droppedFrames = AtomicInteger(0)
     private val sentFrames = AtomicInteger(0)
+    private val sendErrorCount = AtomicInteger(0)
+
+    // 分辨率切换后仅发关键帧直至首帧关键帧发送，便于播放端恢复
+    private val resolutionChangePending = AtomicBoolean(false)
     
     // 静态计数器用于日志（避免日志过多）
     private var staticVideoFrameCount = 0
@@ -132,6 +136,38 @@ class RtmpStreamer {
         }
     }
 
+    /**
+     * 热切换视频编码器（如 ABR 切分辨率时替换为新分辨率编码器）
+     */
+    fun replaceVideoEncoder(newEncoder: VideoEncoder) {
+        videoEncoder = newEncoder
+        savedSps = null
+        savedPps = null
+        newEncoder.setCallback(object : VideoEncoder.EncoderCallback {
+            override fun onEncodedData(data: ByteBuffer, info: MediaCodec.BufferInfo) {
+                if (isStreaming.get()) {
+                    sendVideoData(data, info)
+                } else {
+                    staticVideoFrameCount++
+                    if (staticVideoFrameCount % 30 == 0) {
+                        Log.w(TAG, "收到编码数据但推流未开始 (isStreaming=false), 总帧数=$staticVideoFrameCount")
+                    }
+                }
+            }
+            override fun onCodecConfig(sps: ByteArray, pps: ByteArray) {
+                Log.d(TAG, "收到 SPS/PPS: SPS size=${sps.size}, PPS size=${pps.size}, isStreaming=${isStreaming.get()}")
+                savedSps = sps
+                savedPps = pps
+                if (rtmpHandle != 0L && isStreaming.get()) {
+                    sendSpsPps()
+                }
+            }
+            override fun onError(error: String) {
+                Log.e(TAG, "视频编码错误: $error")
+            }
+        })
+        Log.d(TAG, "已替换视频编码器")
+    }
 
     /**
      * 开始推流
@@ -227,9 +263,13 @@ class RtmpStreamer {
                     val sendDuration = System.currentTimeMillis() - sendStartTime
                     
                     if (result != 0) {
+                        sendErrorCount.incrementAndGet()
                         Log.w(TAG, "发送视频数据失败: $result, 耗时=${sendDuration}ms")
                         handleSocketError(result)
                     } else {
+                        if (frame.isKeyFrame) {
+                            resolutionChangePending.set(false)
+                        }
                         sentFrames.incrementAndGet()
                         framesInLastSecond++
                         
@@ -519,12 +559,17 @@ class RtmpStreamer {
                 Log.d(TAG, "收到视频数据: size=${info.size}, pts=${info.presentationTimeUs}, isKeyFrame=$isKeyFrame (总帧数=$staticVideoFrameCount, 队列大小=$currentQueueSize)")
             }
 
+            // 分辨率切换后仅发关键帧直至首帧关键帧发送，便于播放端恢复
+            if (resolutionChangePending.get() && !isKeyFrame) {
+                return
+            }
+
             // 将帧加入发送队列（异步发送，避免阻塞编码器回调线程）
             val frame = VideoFrame(bytes, info.size, timestamp, isKeyFrame)
             
             // 如果队列满了，根据策略处理：
             // 1. 如果是关键帧，清空队列并加入关键帧（确保关键帧能发送）
-            // 2. 如果是非关键帧，直接丢弃
+            // 2. 如果是非关键帧，尝试丢弃最旧的帧（FIFO策略）
             if (!videoSendQueue.offer(frame)) {
                 // 队列满了
                 if (isKeyFrame) {
@@ -538,7 +583,9 @@ class RtmpStreamer {
                     droppedFrames.addAndGet(queueSize)
                     Log.w(TAG, "队列满，清空队列以插入关键帧 (清空了 $queueSize 帧)")
                 } else {
-                    // 非关键帧：直接丢弃
+                    // 非关键帧：尝试丢弃最旧的帧（FIFO策略），为新帧腾出空间
+                    // 注意：LinkedBlockingQueue 不支持直接移除最旧的元素，所以只能丢弃当前帧
+                    // 但我们可以通过检查队列大小来优化：如果队列接近满，丢弃当前帧
                     droppedFrames.incrementAndGet()
                     val dropped = droppedFrames.get()
                     if (dropped % 30 == 0) {
@@ -548,6 +595,11 @@ class RtmpStreamer {
             } else {
                 // 成功加入队列，更新大小计数
                 videoQueueSize.incrementAndGet()
+                
+                // 如果队列大小超过阈值，记录警告（用于监控网络状况）
+                if (currentQueueSize > 20) {
+                    Log.w(TAG, "视频发送队列积压严重: $currentQueueSize 帧，可能存在网络问题")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "处理视频数据异常", e)
@@ -644,6 +696,28 @@ class RtmpStreamer {
      * 是否正在推流
      */
     fun isStreaming(): Boolean = isStreaming.get()
+
+    fun getDroppedFrames(): Int = droppedFrames.get()
+    fun getSendErrorCount(): Int = sendErrorCount.get()
+    fun resetDroppedFrames() {
+        droppedFrames.set(0)
+    }
+
+    /**
+     * 分辨率切换后设为 true，发送首帧关键帧后自动清除
+     */
+    fun setResolutionChangePending(pending: Boolean) {
+        resolutionChangePending.set(pending)
+    }
+
+    /**
+     * 分辨率切换完成后调用：更新元数据、发送 SPS/PPS、标记仅发关键帧直至首帧
+     */
+    fun onResolutionChangeComplete(width: Int, height: Int, videoBitrate: Int, fps: Int, audioSampleRate: Int, audioChannels: Int) {
+        setMetadata(width, height, videoBitrate, fps, audioSampleRate, audioChannels)
+        sendSpsPps()
+        setResolutionChangePending(true)
+    }
 }
 
 /**

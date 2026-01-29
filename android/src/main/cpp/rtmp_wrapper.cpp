@@ -643,20 +643,23 @@ int rtmp_set_metadata(rtmp_handle_t handle, int width, int height, int video_bit
         return -1;
     }
     Connection &conn = it->second;
+    int old_w = conn.width, old_h = conn.height;
     conn.width = width;
     conn.height = height;
     conn.video_bitrate = video_bitrate;
     conn.fps = fps;
     conn.sample_rate = audio_sample_rate;
     conn.channels = audio_channels;
+    /* 分辨率变化时需再次发送 AVC 序列头 + onMetaData，否则服务端仍显示旧分辨率且无视频 */
+    if (old_w != width || old_h != height) {
+        conn.sent_metadata = false;
+        conn.sent_video_config = false;  /* 下一帧带 SPS/PPS 时会重发 AVC sequence header */
+    }
     LOGD("设置元数据: %dx%d (宽x高), bitrate=%d, fps=%d, audio=%dHz/%dch", 
          width, height, video_bitrate, fps, audio_sample_rate, audio_channels);
     LOGD("元数据方向: %s (宽%s高)", 
          width < height ? "竖屏" : (width > height ? "横屏" : "正方形"),
          width < height ? "<" : (width > height ? ">" : "=="));
-    
-    // 如果元数据已完整且还未发送，尝试发送（需要先有视频配置）
-    // 注意：onMetaData 通常在发送第一个视频帧时发送，这里只是设置参数
     return 0;
 }
 

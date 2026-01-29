@@ -371,8 +371,18 @@ int rtmp_set_metadata(rtmp_handle_t handle, int width, int height, int video_bit
     auto it = g_connections.find(handle);
     if (it == g_connections.end() || !it->second.connected) return -1;
     Connection &conn = it->second;
-    conn.width = width; conn.height = height; conn.video_bitrate = video_bitrate;
-    conn.fps = fps; conn.sample_rate = audio_sample_rate; conn.channels = audio_channels;
+    int old_w = conn.width, old_h = conn.height;
+    conn.width = width;
+    conn.height = height;
+    conn.video_bitrate = video_bitrate;
+    conn.fps = fps;
+    conn.sample_rate = audio_sample_rate;
+    conn.channels = audio_channels;
+    /* 分辨率变化时需再次发送 AVC 序列头 + onMetaData，否则 SRS 仍显示旧分辨率且无视频 */
+    if (old_w != width || old_h != height) {
+        conn.sent_metadata = false;
+        conn.sent_video_config = false;  /* 下一帧带 SPS/PPS 时会重发 AVC sequence header */
+    }
     return 0;
 }
 

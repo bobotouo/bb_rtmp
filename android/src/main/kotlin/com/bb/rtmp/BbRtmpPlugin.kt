@@ -76,6 +76,8 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
     @Volatile
     private var isFboRenderLoopRunning = false
     private var fboRenderJob: kotlinx.coroutines.Job? = null
+    /** 调试用：推流开始后每 10s 高↔低分辨率切换，观察正常后删除 */
+    private var debugResolutionSwitchJob: kotlinx.coroutines.Job? = null
     // 时间戳管理（用于确保时间戳递增，避免编码器丢帧）
     private var lastTimestampNs: Long = 0
     
@@ -288,7 +290,30 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     previewSurface = surface
                     isPreviewSurfaceReady = true
                     android.util.Log.i("BbRtmpPlugin", "PlatformView Surface Created")
-                    // 如果相机及 FBO 已经准备好，但因为缺少 previewSurface 而暂停，此时可以尝试启动
+                    // 后台切前台时 Surface 会重新创建，渲染循环已退出且 glRenderer 被置空；旧编码器 Surface 在 EGL 释放后可能失效，需重建编码器+GlRenderer 才能恢复推流
+                    if (glRenderer == null && fboInputSurfaceTexture != null && cameraController != null && glFboCanvasWidth > 0 && glFboCanvasHeight > 0) {
+                        android.util.Log.i("BbRtmpPlugin", "Surface 重建后恢复编码器与 GlRenderer 并重启渲染循环")
+                        val bitrate = bitrateController?.getCurrentBitrate() ?: videoEncoder?.getCurrentBitrate() ?: 2000000
+                        val newEncoder = VideoEncoder()
+                        val newSurface = newEncoder.initialize(glFboCanvasWidth, glFboCanvasHeight, bitrate, 30)
+                        if (newSurface != null) {
+                            val oldEncoder = videoEncoder
+                            videoEncoder = newEncoder
+                            oldEncoder?.release()
+                            glEncoderSurface = newSurface
+                            if (rtmpStreamer != null) {
+                                rtmpStreamer!!.replaceVideoEncoder(videoEncoder!!)
+                                if (rtmpStreamer!!.isStreaming()) {
+                                    val audioRate = audioEncoder?.getSampleRate() ?: 44100
+                                    val audioCh = audioEncoder?.getChannelCount() ?: 1
+                                    rtmpStreamer!!.onResolutionChangeComplete(glFboCanvasWidth, glFboCanvasHeight, bitrate, 30, audioRate, audioCh)
+                                    videoEncoder?.requestKeyFrame()
+                                }
+                            }
+                        }
+                        glRenderer = GlRenderer()
+                        cameraTextureId = 0
+                    }
                     tryStartRenderLoopIfReady()
                 },
                 onSurfaceChanged = { width: Int, height: Int ->
@@ -529,10 +554,13 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                 }
             })
 
-            // 初始化码率控制器
+            // 初始化码率控制器（ABR 一步到位切分辨率时热切换编码器）
             if (rtmpStreamer != null) {
                 bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, cameraController!!)
                 bitrateController!!.initialize(bitrate, fboCanvasWidth, fboCanvasHeight)
+                bitrateController!!.setResolutionChangeCallback { w, h ->
+                    scope.launch(Dispatchers.Main) { doHotResolutionSwitch(w, h) }
+                }
             }
 
             // 10. 打开相机
@@ -564,6 +592,53 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     glCameraWidth,
                     glCameraHeight
                 )
+            }
+        }
+    }
+
+    /**
+     * ABR 触发的分辨率热切换：不中断推流，替换编码器并更新 metadata/SPS/PPS，仅发关键帧直至首帧
+     */
+    private fun doHotResolutionSwitch(w: Int, h: Int) {
+        if (rtmpStreamer == null || !rtmpStreamer!!.isStreaming() || bitrateController == null || cameraController == null) return
+        scope.launch(Dispatchers.Default) {
+            isFboRenderLoopRunning = false
+            fboRenderJob?.join()
+            fboRenderJob = null
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                try {
+                    val oldEncoder = videoEncoder
+                    videoEncoder = VideoEncoder()
+                    val bitrate = bitrateController!!.getCurrentBitrate()
+                    val surface = videoEncoder!!.initialize(w, h, bitrate, 30)
+                    if (surface == null) {
+                        android.util.Log.e("BbRtmpPlugin", "doHotResolutionSwitch: 新编码器初始化失败")
+                        tryStartRenderLoopIfReady()
+                        return@withContext
+                    }
+                    oldEncoder?.release()
+                    rtmpStreamer!!.replaceVideoEncoder(videoEncoder!!)
+                    val audioRate = audioEncoder?.getSampleRate() ?: 44100
+                    val audioCh = audioEncoder?.getChannelCount() ?: 1
+                    rtmpStreamer!!.onResolutionChangeComplete(w, h, bitrate, 30, audioRate, audioCh)
+                    glFboCanvasWidth = w
+                    glFboCanvasHeight = h
+                    glEncoderSurface = surface
+                    streamWidth = w
+                    streamHeight = h
+                    bitrateController!!.updateResolution(w, h)
+                    videoEncoder?.requestKeyFrame()
+                    // 上一轮循环退出时 finally 里已置 glRenderer=null，必须重建否则 tryStartRenderLoopIfReady 不会启动
+                    if (glRenderer == null) {
+                        glRenderer = GlRenderer()
+                        cameraTextureId = 0
+                    }
+                    tryStartRenderLoopIfReady()
+                    android.util.Log.i("BbRtmpPlugin", "doHotResolutionSwitch: ${w}x${h} 完成")
+                } catch (e: Exception) {
+                    android.util.Log.e("BbRtmpPlugin", "doHotResolutionSwitch 异常", e)
+                    tryStartRenderLoopIfReady()
+                }
             }
         }
     }
@@ -642,9 +717,12 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                         // 设置 RTMP 元数据
                         rtmpStreamer!!.setMetadata(glFboCanvasWidth, glFboCanvasHeight, newBitrate, 30, 44100, 1)
                         
-                        // 初始化码率控制器
+                        // 初始化码率控制器（ABR 一步到位切分辨率时热切换编码器）
                         bitrateController = BitrateController(videoEncoder!!, rtmpStreamer!!, cameraController!!)
                         bitrateController!!.initialize(newBitrate, glFboCanvasWidth, glFboCanvasHeight)
+                        bitrateController!!.setResolutionChangeCallback { w, h ->
+                            scope.launch(Dispatchers.Main) { doHotResolutionSwitch(w, h) }
+                        }
                     } else {
                         // RTMP 已初始化，直接使用现有配置
                     }
@@ -657,6 +735,7 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     rtmpStreamer?.start()
                     bitrateController?.start()
                     audioEncoder?.start()
+                    startDebugResolutionSwitchLoop()
                     
                     context?.let { ctx ->
                         val intent = android.content.Intent(ctx, RtmpService::class.java)
@@ -679,6 +758,22 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         }
     }
     
+    /**
+     * 调试用：推流开始后每 30s 在高(720p)与低(480p)分辨率间切换，观察正常后删除本方法及 debugResolutionSwitchJob、startDebugResolutionSwitchLoop 调用
+     */
+    private fun startDebugResolutionSwitchLoop() {
+        debugResolutionSwitchJob?.cancel()
+        debugResolutionSwitchJob = scope.launch(Dispatchers.Main) {
+            while (rtmpStreamer?.isStreaming() == true) {
+                kotlinx.coroutines.delay(30000)
+                if (rtmpStreamer?.isStreaming() != true) break
+                val (w, h) = if (glFboCanvasHeight <= 480) 1280 to 720 else 854 to 480
+                android.util.Log.i("BbRtmpPlugin", "[DEBUG] 每30s切换分辨率: ${w}x${h}")
+                doHotResolutionSwitch(w, h)
+            }
+        }
+    }
+
     /**
      * 通知推流状态变化
      */
@@ -734,6 +829,8 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
 
     private fun stopStreaming(result: Result) {
         try {
+            debugResolutionSwitchJob?.cancel()
+            debugResolutionSwitchJob = null
             // 1. 先停止推流和码率控制
             rtmpStreamer?.stop()
             bitrateController?.stop()
@@ -780,9 +877,9 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
             val oldSurfaceTexture = fboInputSurfaceTexture
             fboInputSurfaceTexture = null
             
-            if (glRenderer != null) {
-                glRenderer = null
-            }
+            // 释放旧的 GlRenderer（如果存在）
+            glRenderer?.release()
+            glRenderer = null
             cameraTextureId = 0
             
             oldSurfaceTexture?.release()
@@ -809,6 +906,13 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                     this.glCameraWidth = newSize.width
                     this.glCameraHeight = newSize.height
                 }
+                
+                // 重新创建 GlRenderer（因为之前的已释放）
+                glRenderer = GlRenderer()
+                
+                // 恢复渲染循环
+                tryStartRenderLoopIfReady()
+                
                 videoEncoder?.requestKeyFrame()
                 result.success(null)
             } else {
@@ -1072,6 +1176,8 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                 // 异常处理和重试机制（在循环外定义，保持状态）
                 var updateTexImageErrorCount = 0
                 val maxUpdateTexImageErrors = 10
+                var consecutiveErrors = 0
+                val maxConsecutiveErrors = 30 // 连续30次错误后停止循环
 
                 while (isFboRenderLoopRunning && glRenderer != null && cameraTextureId != 0) {
                     try {
@@ -1102,7 +1208,14 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                             continue
                         }
                         
+                        // 后台时暂停渲染，但保持循环运行（避免相机和编码器停止）
                         if (isInBackground) {
+                            Thread.sleep(100) // 后台时降低渲染频率
+                            continue
+                        }
+                        
+                        // 检查预览Surface是否有效
+                        if (!isPreviewSurfaceReady || previewSurface == null) {
                             Thread.sleep(33)
                             continue
                         }
@@ -1215,7 +1328,30 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
                         if (sleepTime > 0) Thread.sleep(sleepTime)
                         
                     } catch (e: Exception) {
-                        android.util.Log.e("BbRtmpPlugin", "渲染循环异常", e)
+                        consecutiveErrors++
+                        android.util.Log.e("BbRtmpPlugin", "渲染循环异常 (连续错误: $consecutiveErrors)", e)
+                        
+                        // 如果是关键错误（如EGL context丢失），停止渲染循环
+                        if (e.message?.contains("EGL") == true || 
+                            e.message?.contains("context") == true ||
+                            e.message?.contains("surface") == true) {
+                            android.util.Log.e("BbRtmpPlugin", "检测到关键错误，停止渲染循环: ${e.message}")
+                            break
+                        }
+                        
+                        // 连续错误过多，停止渲染循环
+                        if (consecutiveErrors >= maxConsecutiveErrors) {
+                            android.util.Log.e("BbRtmpPlugin", "连续错误过多 ($consecutiveErrors)，停止渲染循环")
+                            break
+                        }
+                        
+                        // 其他错误短暂等待后继续
+                        Thread.sleep(10)
+                    }
+                    
+                    // 成功渲染一帧，重置错误计数
+                    if (consecutiveErrors > 0) {
+                        consecutiveErrors = 0
                     }
                 }
             } catch (e: Exception) {
@@ -1641,23 +1777,76 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         override fun onActivityResumed(activity: android.app.Activity) {}
         override fun onActivityStarted(activity: android.app.Activity) {
             if (activity == this@BbRtmpPlugin.activity) {
+                android.util.Log.i("BbRtmpPlugin", "Activity Started - 恢复预览和推流")
                 isInBackground = false
                 rtmpStreamer?.stopHeartbeat()
-                if (rtmpStreamer?.isStreaming() == true) {
-                    cameraController?.let { controller ->
-                        scope.launch(Dispatchers.Main) {
+                
+                // 恢复相机和渲染循环
+                cameraController?.let { controller ->
+                    scope.launch(Dispatchers.Main) {
+                        try {
                             if (!controller.isCameraDeviceOpen()) {
+                                // 相机已关闭，需要重新打开
+                                android.util.Log.i("BbRtmpPlugin", "相机已关闭，重新打开相机")
+                                
+                                // 确保渲染循环已停止
                                 stopFboRenderLoop()
-                                glRenderer = null
+                                
+                                // 重新创建 GlRenderer 和 SurfaceTexture
+                                glRenderer?.release()
+                                glRenderer = GlRenderer()
+                                cameraTextureId = 0
+                                
+                                fboInputSurfaceTexture?.release()
                                 fboInputSurfaceTexture = SurfaceTexture(false)
                                 fboInputSurfaceTexture!!.setDefaultBufferSize(glCameraWidth, glCameraHeight)
+                                
+                                // 重新创建 ImageReader
+                                imageReader?.close()
+                                imageReader = ImageReader.newInstance(glCameraWidth, glCameraHeight, android.graphics.ImageFormat.YUV_420_888, 4)
+                                imageReader?.setOnImageAvailableListener(imageAvailableListener, null)
+                                imageReaderSurface?.release()
+                                imageReaderSurface = imageReader?.surface
+                                
+                                // 重新打开相机
+                                controller.setStateCallback(object : CameraController.CameraStateCallback {
+                                    override fun onCameraOpened() {
+                                        scope.launch(Dispatchers.Main) {
+                                            android.util.Log.i("BbRtmpPlugin", "相机重新打开成功，恢复渲染循环")
+                                            // 恢复渲染循环
+                                            tryStartRenderLoopIfReady()
+                                        }
+                                    }
+                                    
+                                    override fun onCameraError(error: String) {
+                                        android.util.Log.e("BbRtmpPlugin", "恢复相机失败: $error")
+                                    }
+                                })
+                                
                                 controller.openCamera(glCameraWidth, glCameraHeight, fboInputSurfaceTexture!!)
                             } else {
+                                // 相机仍然打开，恢复渲染循环和预览
+                                android.util.Log.i("BbRtmpPlugin", "相机仍然打开，恢复渲染循环")
+                                
+                                // 请求关键帧，确保推流恢复
                                 videoEncoder?.requestKeyFrame()
+                                
+                                // 恢复渲染循环（如果已停止）
+                                if (!isFboRenderLoopRunning && previewSurface != null && isPreviewSurfaceReady) {
+                                    tryStartRenderLoopIfReady()
+                                }
+                                
+                                // 重新创建捕获会话，确保预览恢复
                                 try {
-                                    controller.createCaptureSession(emptyList())
-                                } catch (e: Exception) {}
+                                    val surfaces = mutableListOf<Surface>()
+                                    imageReaderSurface?.let { surfaces.add(it) }
+                                    controller.createCaptureSession(surfaces)
+                                } catch (e: Exception) {
+                                    android.util.Log.e("BbRtmpPlugin", "恢复捕获会话失败", e)
+                                }
                             }
+                        } catch (e: Exception) {
+                            android.util.Log.e("BbRtmpPlugin", "恢复预览和推流失败", e)
                         }
                     }
                 }
@@ -1665,8 +1854,13 @@ class BbRtmpPlugin : FlutterPlugin, MethodCallHandler, io.flutter.embedding.engi
         }
         override fun onActivityStopped(activity: android.app.Activity) {
             if (activity == this@BbRtmpPlugin.activity) {
+                android.util.Log.i("BbRtmpPlugin", "Activity Stopped - 进入后台")
                 isInBackground = true
-                if (rtmpStreamer?.isStreaming() == true) rtmpStreamer?.startHeartbeat()
+                // 注意：不要停止渲染循环，只是标记为后台状态
+                // 渲染循环会检测 isInBackground 并暂停渲染，但保持相机和编码器运行
+                if (rtmpStreamer?.isStreaming() == true) {
+                    rtmpStreamer?.startHeartbeat()
+                }
             }
         }
         override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}

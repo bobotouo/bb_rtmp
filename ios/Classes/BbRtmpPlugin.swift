@@ -4,6 +4,7 @@ import AVFoundation
 import VideoToolbox
 import CoreVideo
 import Accelerate
+import Network
 
 @objc public class BbRtmpPlugin: NSObject, FlutterPlugin {
     private var channel: FlutterMethodChannel?
@@ -13,14 +14,24 @@ import Accelerate
     private var statusEventChannel: FlutterEventChannel?
     private var statusEventSink: FlutterEventSink?
     
-    private var videoEncoder: VideoEncoder?
+    /// 三路编码：1080p / 720p / 480p，推流只发其中一路；帧回调和预览始终 1080p
+    private static let kRes1080 = (1920, 1080)
+    private static let kRes720 = (1280, 720)
+    private static let kRes480 = (854, 480)
+    
+    private var videoEncoders: [VideoEncoder] = []  // [1080p, 720p, 480p]
+    private var videoEncoder: VideoEncoder? { videoEncoders.first }  // 兼容单路调用
     private var audioEncoder: AudioEncoder?
     private var rtmpStreamer: RtmpStreamer?
     private var bitrateController: BitrateController?
     
     private var rtmpUrl: String = ""
+    /// FBO/预览/帧回调始终 1080p，不随 ABR 改变
     private var streamWidth: Int = 0
     private var streamHeight: Int = 0
+    private var baseBitrate: Int = 2_000_000 // Base bitrate for network adjustment
+    private var minBitrate: Int = 500_000 // Min bitrate
+    private var maxBitrate: Int = 5_000_000 // Max bitrate
     
     // Camera capture
     private var captureSession: AVCaptureSession?
@@ -34,11 +45,14 @@ import Accelerate
     private var isFront: Bool = true
     private var scaleMode: String = "fit"
     
-    // FBO Rendering
+    // FBO Rendering（始终 1080p）
     private var ciContext: CIContext?
     private var fboBufferPool: CVPixelBufferPool?
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
+    // 720p/480p 缩放用 buffer 池
+    private var scalePool720: CVPixelBufferPool?
+    private var scalePool480: CVPixelBufferPool?
     
     // Frame callback
     private var enableFrameCallback: Bool = false
@@ -58,6 +72,16 @@ import Accelerate
     // Background handling
     private var isInBackground: Bool = false
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    
+    // Network monitoring
+    private var networkMonitor: NWPathMonitor?
+    private var networkMonitorQueue: DispatchQueue?
+    private var lastNetworkType: NWInterface.InterfaceType?
+    
+    /// 升档前预热：要切到的目标 level，预热 N 帧后再真正切换，切过去后上一路停掉
+    private var preparingSwitchToLevel: Int? = nil
+    private var preparingSwitchFrameCount: Int = 0
+    private let preparingSwitchWarmupFrames = 30  // ~1s @ 30fps
     
     // Helper methods for StatusStreamHandler to access private properties
     func setFrameEventSink(_ sink: FlutterEventSink?) {
@@ -98,6 +122,9 @@ import Accelerate
         // Register for lifecycle notifications
         NotificationCenter.default.addObserver(instance, selector: #selector(instance.appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(instance, selector: #selector(instance.appWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        
+        // Start network monitoring
+        instance.startNetworkMonitoring()
     }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -173,6 +200,7 @@ import Accelerate
         let width = args["width"] as? Int ?? 1920
         let height = args["height"] as? Int ?? 1080
         let bitrate = args["bitrate"] as? Int ?? 2_000_000
+        self.baseBitrate = bitrate
         let fps = args["fps"] as? Int ?? 30
         let enableAudio = args["enableAudio"] as? Bool ?? true
         let isPortrait = args["isPortrait"] as? Bool ?? false
@@ -180,9 +208,9 @@ import Accelerate
         let scaleMode = args["scaleMode"] as? String ?? "fit"
         
         self.rtmpUrl = rtmpUrl
-        // Force landscape dimensions for FBO to match Android "Always Landscape FBO"
-        self.streamWidth = max(width, height)
-        self.streamHeight = min(width, height)
+        // 三路编码：FBO/预览/帧回调固定 1080p
+        self.streamWidth = Self.kRes1080.0
+        self.streamHeight = Self.kRes1080.1
         
         self.isPortrait = isPortrait
         self.isFront = initialCameraFacing == "front"
@@ -215,12 +243,21 @@ import Accelerate
     }
     
     private func setupCapture(bitrate: Int, fps: Int, enableAudio: Bool, isFront: Bool, result: @escaping FlutterResult) {
-        // Initialize video encoder with FORCED LANDSCAPE dimensions
-        videoEncoder = VideoEncoder()
-        guard let videoEncoder = videoEncoder, videoEncoder.initialize(width: self.streamWidth, height: self.streamHeight, bitrate: bitrate, fps: fps) else {
-            result(FlutterError(code: "ENCODER_INIT_FAILED", message: "Failed to initialize video encoder", details: nil))
+        // 三路编码：1080p / 720p / 480p
+        let (w1080, h1080) = Self.kRes1080
+        let (w720, h720) = Self.kRes720
+        let (w480, h480) = Self.kRes480
+        
+        let enc1080 = VideoEncoder()
+        let enc720 = VideoEncoder()
+        let enc480 = VideoEncoder()
+        guard enc1080.initialize(width: w1080, height: h1080, bitrate: bitrate, fps: fps),
+              enc720.initialize(width: w720, height: h720, bitrate: bitrate, fps: fps),
+              enc480.initialize(width: w480, height: h480, bitrate: bitrate, fps: fps) else {
+            result(FlutterError(code: "ENCODER_INIT_FAILED", message: "Failed to initialize video encoders", details: nil))
             return
         }
+        videoEncoders = [enc1080, enc720, enc480]
         
         // Initialize audio encoder
         if enableAudio {
@@ -234,26 +271,23 @@ import Accelerate
         // Initialize RTMP streamer only if URL is not empty
         if !rtmpUrl.isEmpty {
             rtmpStreamer = RtmpStreamer()
-            // 设置状态回调
             rtmpStreamer?.setStatusCallback { [weak self] status, error in
                 self?.notifyStreamingStatus(status: status, error: error)
             }
-            guard let rtmpStreamer = rtmpStreamer, rtmpStreamer.initialize(url: rtmpUrl, videoEncoder: videoEncoder, audioEncoder: audioEncoder) else {
+            guard let rtmpStreamer = rtmpStreamer, rtmpStreamer.initialize(url: rtmpUrl, videoEncoders: videoEncoders, activeEncoderIndex: 0, audioEncoder: audioEncoder) else {
                 result(FlutterError(code: "RTMP_INIT_FAILED", message: "Failed to initialize RTMP", details: nil))
                 return
             }
             
-            // Set metadata with FORCED LANDSCAPE dimensions
             let audioSampleRate = audioEncoder?.getSampleRate() ?? 44100
             let audioChannels = audioEncoder?.getChannelCount() ?? 1
-            rtmpStreamer.setMetadata(width: self.streamWidth, height: self.streamHeight, videoBitrate: bitrate, fps: fps, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
+            rtmpStreamer.setMetadata(width: w1080, height: h1080, videoBitrate: bitrate, fps: fps, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
             
-            // Initialize bitrate controller
-            bitrateController = BitrateController(videoEncoder: videoEncoder, rtmpStreamer: rtmpStreamer)
-            bitrateController?.initialize(initialBitrate: bitrate, width: self.streamWidth, height: self.streamHeight)
-        } else {
-            // Empty URL: preview mode, set encoder callback later in startStreaming
-            // Note: VideoEncoder will save SPS/PPS and notify when callback is set
+            bitrateController = BitrateController(videoEncoder: enc1080, rtmpStreamer: rtmpStreamer)
+            bitrateController?.initialize(initialBitrate: bitrate, width: w1080, height: h1080)
+            bitrateController?.setResolutionChangeCallback { [weak self] newWidth, newHeight in
+                self?.changeResolution(width: newWidth, height: newHeight)
+            }
         }
         
         // Setup camera
@@ -383,60 +417,52 @@ import Accelerate
             return
         }
         
-        guard let videoEncoder = videoEncoder else {
-            result(FlutterError(code: "NOT_INITIALIZED", message: "Video encoder not initialized", details: nil))
+        guard !videoEncoders.isEmpty else {
+            result(FlutterError(code: "NOT_INITIALIZED", message: "Video encoders not initialized", details: nil))
             return
         }
         
-        // 立即返回，不等待连接完成
         result(nil)
-        
-        // 发送连接中状态
         notifyStreamingStatus(status: "connecting", error: nil)
         
-        // 在后台线程中初始化 RTMP 连接
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            // Check if RTMP streamer needs to be initialized
             if self.rtmpStreamer == nil {
-                // 初始化音频编码器（如果需要且未初始化）
                 if enableAudio && self.audioEncoder == nil {
                     self.audioEncoder = AudioEncoder()
                     if !(self.audioEncoder?.initialize() ?? false) {
-                        print("[BbRtmpPlugin] Failed to initialize audio encoder")
                         self.audioEncoder = nil
                     }
                 }
-                
-                // Initialize RTMP streamer
                 self.rtmpStreamer = RtmpStreamer()
-                // 设置状态回调
                 self.rtmpStreamer?.setStatusCallback { [weak self] status, error in
                     self?.notifyStreamingStatus(status: status, error: error)
                 }
-                guard let rtmpStreamer = self.rtmpStreamer, rtmpStreamer.initialize(url: newRtmpUrl, videoEncoder: videoEncoder, audioEncoder: self.audioEncoder) else {
+                guard let rtmpStreamer = self.rtmpStreamer, rtmpStreamer.initialize(url: newRtmpUrl, videoEncoders: self.videoEncoders, activeEncoderIndex: 0, audioEncoder: self.audioEncoder) else {
                     self.notifyStreamingStatus(status: "failed", error: "Failed to initialize RTMP")
                     self.rtmpStreamer = nil
                     return
                 }
-                
-                // Set metadata
                 let audioSampleRate = self.audioEncoder?.getSampleRate() ?? 44100
                 let audioChannels = self.audioEncoder?.getChannelCount() ?? 1
                 let bitrate = self.bitrateController?.getCurrentBitrate() ?? 2_000_000
-                rtmpStreamer.setMetadata(width: self.streamWidth, height: self.streamHeight, videoBitrate: bitrate, fps: 30, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
-                
-                // Initialize bitrate controller
-                self.bitrateController = BitrateController(videoEncoder: videoEncoder, rtmpStreamer: rtmpStreamer)
-                self.bitrateController?.initialize(initialBitrate: bitrate, width: self.streamWidth, height: self.streamHeight)
+                rtmpStreamer.setMetadata(width: Self.kRes1080.0, height: Self.kRes1080.1, videoBitrate: bitrate, fps: 30, audioSampleRate: audioSampleRate, audioChannels: audioChannels)
+                self.bitrateController = BitrateController(videoEncoder: self.videoEncoders[0], rtmpStreamer: rtmpStreamer)
+                self.bitrateController?.initialize(initialBitrate: bitrate, width: Self.kRes1080.0, height: Self.kRes1080.1)
+                self.bitrateController?.setResolutionChangeCallback { [weak self] newWidth, newHeight in
+                    self?.changeResolution(width: newWidth, height: newHeight)
+                }
             }
             
             self.rtmpStreamer?.start()
-            self.bitrateController?.start()
             _ = self.audioEncoder?.start()
-            
-            // 发送连接成功状态
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.bitrateController?.start()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.rtmpStreamer?.getActiveVideoEncoder()?.requestKeyFrame()
+            }
             self.notifyStreamingStatus(status: "connected", error: nil)
         }
     }
@@ -580,9 +606,13 @@ import Accelerate
         captureSession?.stopRunning()
         captureSession = nil
         
+        // Stop network monitoring
+        stopNetworkMonitoring()
+        
         bitrateController?.release()
         rtmpStreamer?.release()
-        videoEncoder?.release()
+        for enc in videoEncoders { enc.release() }
+        videoEncoders.removeAll()
         audioEncoder?.release()
         
         previewTexture?.release()
@@ -603,8 +633,138 @@ import Accelerate
         
         bitrateController = nil
         rtmpStreamer = nil
-        videoEncoder = nil
         audioEncoder = nil
+        scalePool720 = nil
+        scalePool480 = nil
+    }
+    
+    // MARK: - Network Monitoring
+    
+    /**
+     * Start monitoring network state changes
+     */
+    private func startNetworkMonitoring() {
+        networkMonitor = NWPathMonitor()
+        networkMonitorQueue = DispatchQueue(label: "com.bb.rtmp.network")
+        
+        networkMonitor?.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            
+            // Get current network type
+            let currentType: NWInterface.InterfaceType?
+            if path.usesInterfaceType(.wifi) {
+                currentType = .wifi
+            } else if path.usesInterfaceType(.cellular) {
+                currentType = .cellular
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                currentType = .wiredEthernet
+            } else {
+                currentType = nil
+            }
+            
+            // Check if network type changed
+            if let lastType = self.lastNetworkType, let currentType = currentType {
+                if lastType != currentType {
+                    print("[BbRtmpPlugin] Network type changed: \(lastType) -> \(currentType)")
+                    self.handleNetworkChange(isConnected: path.status == .satisfied, type: currentType)
+                }
+            } else if self.lastNetworkType == nil && currentType != nil {
+                // First time detecting network
+                print("[BbRtmpPlugin] Network detected: \(currentType!)")
+                // Also trigger initial network change handler
+                if path.status == .satisfied {
+                    self.handleNetworkChange(isConnected: true, type: currentType!)
+                }
+            }
+            
+            self.lastNetworkType = currentType
+            
+            // Also check connection status changes
+            let wasConnected = self.lastNetworkType != nil
+            let isConnected = path.status == .satisfied
+            
+            if !wasConnected && isConnected && currentType != nil {
+                print("[BbRtmpPlugin] Network became available: \(currentType!)")
+                self.handleNetworkChange(isConnected: true, type: currentType!)
+            } else if wasConnected && !isConnected {
+                print("[BbRtmpPlugin] Network became unavailable")
+            }
+        }
+        
+        networkMonitor?.start(queue: networkMonitorQueue!)
+        print("[BbRtmpPlugin] Network monitoring started")
+    }
+    
+    /**
+     * Stop network monitoring
+     */
+    private func stopNetworkMonitoring() {
+        networkMonitor?.cancel()
+        networkMonitor = nil
+        networkMonitorQueue = nil
+        lastNetworkType = nil
+        print("[BbRtmpPlugin] Network monitoring stopped")
+    }
+    
+    /**
+     * Handle network change
+     */
+    private func handleNetworkChange(isConnected: Bool, type: NWInterface.InterfaceType) {
+        guard isConnected else { return }
+        guard let controller = bitrateController, controller.isRunning() else {
+            print("[BbRtmpPlugin] BitrateController not running, skipping network change handling")
+            return
+        }
+        
+        // Adjust bitrate based on network type
+        let currentBitrate = controller.getCurrentBitrate()
+        var newBitrate = currentBitrate
+        
+        switch type {
+        case .wifi:
+            // WiFi: can use higher bitrate (up to base bitrate)
+            // But check current network stats first - if network is poor, don't increase
+            if let stats = rtmpStreamer?.getStats() {
+                let delay = stats.delayMs
+                let packetLoss = stats.packetLossPercent
+                if delay < 200 && packetLoss < 2 {
+                    // Good WiFi: can use base bitrate
+                    if currentBitrate < baseBitrate {
+                        newBitrate = min(baseBitrate, maxBitrate)
+                    }
+                } else {
+                    // Poor WiFi: reduce bitrate
+                    newBitrate = max(Int(Float(baseBitrate) * 0.7), minBitrate) // 70% of base bitrate
+                }
+            } else {
+                // No stats available, use base bitrate for WiFi
+                if currentBitrate < baseBitrate {
+                    newBitrate = min(baseBitrate, maxBitrate)
+                }
+            }
+        case .cellular:
+            // Cellular: reduce bitrate to avoid high data usage and improve stability
+            newBitrate = max(Int(Float(baseBitrate) * 0.6), minBitrate) // 60% of base bitrate
+        case .wiredEthernet:
+            // Wired: can use maximum bitrate
+            if currentBitrate < baseBitrate {
+                newBitrate = min(baseBitrate, maxBitrate)
+            }
+        @unknown default:
+            break
+        }
+        
+        if newBitrate != currentBitrate {
+            print("[BbRtmpPlugin] Network changed to \(type), adjusting bitrate: \(currentBitrate) -> \(newBitrate)")
+            controller.setBitrate(newBitrate)
+            
+            // Request keyframe after bitrate change to ensure smooth transition
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.rtmpStreamer?.getActiveVideoEncoder()?.requestKeyFrame()
+            }
+        } else {
+            print("[BbRtmpPlugin] Network changed to \(type), but bitrate already optimal: \(currentBitrate)")
+        }
     }
     
     // MARK: - Background Handling
@@ -628,9 +788,42 @@ import Accelerate
         // Stop background heartbeat
         rtmpStreamer?.stopHeartbeat()
         
-        // Force a keyframe to recover video quickly
+        // Check if streaming was active before background
         if rtmpStreamer?.isStreamingActive() == true {
-            videoEncoder?.requestKeyFrame()
+            // Wait a bit for encoder to be ready after reset
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self else { return }
+                
+                // Check RTMP connection status and reconnect if needed
+                if let streamer = self.rtmpStreamer, streamer.isStreamingActive() {
+                    // Test connection by checking stats
+                    let stats = streamer.getStats()
+                    if stats == nil {
+                        // Connection lost, need to reconnect
+                        print("[BbRtmpPlugin] RTMP connection lost, reconnecting...")
+                        self.reconnectRtmp()
+                    } else {
+                        // Connection seems OK, just request keyframe
+                        print("[BbRtmpPlugin] RTMP connection OK, requesting keyframe")
+                        self.rtmpStreamer?.getActiveVideoEncoder()?.requestKeyFrame()
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Reconnect RTMP connection
+     */
+    private func reconnectRtmp() {
+        guard let streamer = rtmpStreamer, streamer.isStreamingActive() else { return }
+        
+        // Refresh connection
+        streamer.refreshConnection()
+        
+        // Request keyframe after reconnection
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.rtmpStreamer?.getActiveVideoEncoder()?.requestKeyFrame()
         }
     }
     
@@ -796,6 +989,8 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         
         // 2. Render into FBO (GPU work)
+        // Skip first few frames after starting to avoid stutter
+        // This allows encoder and GPU to warm up
         guard let targetBuffer = renderToFbo(pixelBuffer) else { return }
         
         // 3. Send FBO RGBA data if callback is enabled
@@ -822,8 +1017,9 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         }
         
-        // 4. Encode frame (Hardware Encoder work)
-        videoEncoder?.encodeFrame(pixelBuffer: targetBuffer, presentationTimeUs: presentationTimeUs)
+        // 4. 懒编码：只喂当前推流路 + 下一档（预热），最多 2 路，省 CPU
+        let activeIndex = rtmpStreamer?.getActiveEncoderIndex() ?? 0
+        encodeLazy(activeIndex: activeIndex, targetBuffer: targetBuffer, presentationTimeUs: presentationTimeUs)
         
         // 5. Update preview texture
         DispatchQueue.main.async { [weak self] in
@@ -976,10 +1172,129 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         let blackBg = CIImage(color: CIColor.black).cropped(to: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
         let finalImage = ciImage.composited(over: blackBg)
         
-        // 4. Render to buffer
+        // 4. Render to buffer (output buffer size is targetWidth x targetHeight, which may be lower than 1080p)
         context.render(finalImage, to: outBuffer, bounds: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight), colorSpace: CGColorSpaceCreateDeviceRGB())
         
+        // Verify output buffer size matches target resolution
+        let actualWidth = CVPixelBufferGetWidth(outBuffer)
+        let actualHeight = CVPixelBufferGetHeight(outBuffer)
+        if actualWidth != Int(targetWidth) || actualHeight != Int(targetHeight) {
+            print("[BbRtmpPlugin] Warning: Output buffer size mismatch: expected \(Int(targetWidth))x\(Int(targetHeight)), got \(actualWidth)x\(actualHeight)")
+        }
+        
         return outBuffer
+    }
+    
+    /// 三路 1080p/720p/480p 统一策略：只要触发切换就先预热目标路，预热完再切过去，原路停。平时只喂当前路，只有一路编码不崩。
+    private func encodeLazy(activeIndex: Int, targetBuffer: CVPixelBuffer, presentationTimeUs: Int64) {
+        let pts = presentationTimeUs
+        // 任意切换前预热：喂当前路 + 目标路 N 帧，再切过去，切完后只喂新当前路
+        if let targetLevel = preparingSwitchToLevel {
+            feedEncoder(level: activeIndex, buffer: targetBuffer, pts: pts)
+            feedEncoder(level: targetLevel, buffer: targetBuffer, pts: pts)
+            preparingSwitchFrameCount += 1
+            if preparingSwitchFrameCount >= preparingSwitchWarmupFrames {
+                let (w, h) = resolutionForLevel(targetLevel)
+                preparingSwitchToLevel = nil
+                preparingSwitchFrameCount = 0
+                print("[BbRtmpPlugin] Warmup done, switching to level \(targetLevel) (\(w)x\(h))")
+                rtmpStreamer?.switchToEncoder(index: targetLevel)
+                bitrateController?.updateResolution(width: w, height: h)
+            }
+            return
+        }
+        // 平时只喂当前路，只有一路编码
+        feedEncoder(level: activeIndex, buffer: targetBuffer, pts: pts)
+    }
+    
+    /// 给指定 level 的编码器喂一帧（0=1080p 原图，1=720p 缩放，2=480p 缩放）
+    private func feedEncoder(level: Int, buffer: CVPixelBuffer, pts: Int64) {
+        switch level {
+        case 0:
+            videoEncoders[0].encodeFrame(pixelBuffer: buffer, presentationTimeUs: pts)
+        case 1:
+            if let buf = scaleToSize(source: buffer, targetWidth: Self.kRes720.0, targetHeight: Self.kRes720.1) {
+                videoEncoders[1].encodeFrame(pixelBuffer: buf, presentationTimeUs: pts)
+            }
+        case 2:
+            if let buf = scaleToSize(source: buffer, targetWidth: Self.kRes480.0, targetHeight: Self.kRes480.1) {
+                videoEncoders[2].encodeFrame(pixelBuffer: buf, presentationTimeUs: pts)
+            }
+        default:
+            break
+        }
+    }
+    
+    private func resolutionForLevel(_ level: Int) -> (Int, Int) {
+        switch level {
+        case 0: return (Self.kRes1080.0, Self.kRes1080.1)
+        case 1: return (Self.kRes720.0, Self.kRes720.1)
+        case 2: return (Self.kRes480.0, Self.kRes480.1)
+        default: return (Self.kRes1080.0, Self.kRes1080.1)
+        }
+    }
+    
+    /// 将 1080p buffer 缩放到指定分辨率（用于 720p/480p 编码）
+    private func scaleToSize(source: CVPixelBuffer, targetWidth: Int, targetHeight: Int) -> CVPixelBuffer? {
+        guard let context = ciContext else { return nil }
+        let tw = CGFloat(targetWidth)
+        let th = CGFloat(targetHeight)
+        
+        var pool: CVPixelBufferPool?
+        if targetWidth == Self.kRes720.0 && targetHeight == Self.kRes720.1 {
+            if scalePool720 == nil {
+                let attrs: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: targetWidth,
+                    kCVPixelBufferHeightKey as String: targetHeight,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                ]
+                CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &scalePool720)
+            }
+            pool = scalePool720
+        } else if targetWidth == Self.kRes480.0 && targetHeight == Self.kRes480.1 {
+            if scalePool480 == nil {
+                let attrs: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: targetWidth,
+                    kCVPixelBufferHeightKey as String: targetHeight,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                ]
+                CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &scalePool480)
+            }
+            pool = scalePool480
+        }
+        guard let pool = pool else { return nil }
+        
+        var outBuffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outBuffer)
+        guard let out = outBuffer else { return nil }
+        
+        var ciImage = CIImage(cvPixelBuffer: source)
+        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -ciImage.extent.origin.x, y: -ciImage.extent.origin.y))
+        let scaleX = tw / ciImage.extent.width
+        let scaleY = th / ciImage.extent.height
+        ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        context.render(ciImage, to: out, bounds: CGRect(x: 0, y: 0, width: tw, height: th), colorSpace: CGColorSpaceCreateDeviceRGB())
+        return out
+    }
+    
+    /// 三路编码下：只要触发切换就先预热目标路，预热完再切，原路停。不管升档降档都统一走预热。
+    private func changeResolution(width: Int, height: Int) {
+        let level: Int
+        if width == Self.kRes1080.0 && height == Self.kRes1080.1 { level = 0 }
+        else if width == Self.kRes720.0 && height == Self.kRes720.1 { level = 1 }
+        else if width == Self.kRes480.0 && height == Self.kRes480.1 { level = 2 }
+        else { return }
+        
+        let currentLevel = rtmpStreamer?.getActiveEncoderIndex() ?? 0
+        if level == currentLevel {
+            preparingSwitchToLevel = nil
+            return
+        }
+        preparingSwitchToLevel = level
+        preparingSwitchFrameCount = 0
+        print("[BbRtmpPlugin] Preparing switch to level \(level) (\(width)x\(height)), warming up...")
     }
 }
 
