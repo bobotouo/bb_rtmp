@@ -9,6 +9,7 @@
 - ✅ 自适应码率控制
 - ✅ 摄像头切换
 - ✅ AMF0
+- ✅ 动态分辨率
 
 ## 安装
 
@@ -20,7 +21,7 @@ dependencies:
     path: ./bb_rtmp
 ```
 
-## 使用方法
+## 使用方法(具体参考 example)
 
 ```dart
 import 'package:bb_rtmp/bb_rtmp.dart';
