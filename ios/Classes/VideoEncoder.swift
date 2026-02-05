@@ -17,6 +17,10 @@ class VideoEncoder {
     private var savedPps: Data?
     private let spsPpsLock = NSLock()
     
+    // Force next encoded frame to be keyframe (for resolution switch → fast recovery on playback)
+    private var forceNextKeyFrame = false
+    private let forceKeyFrameLock = NSLock()
+
     // Frame counters for logging
     private var outputFrameCount = 0
     private var emptyFrameCount = 0
@@ -127,12 +131,11 @@ class VideoEncoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
-        // Low bitrate / 480p: shorter GOP 减小关键帧尖峰，拉流端少卡缓冲
+        // 全档位缩短 GOP，关键帧更频繁，拉流端丢包/卡顿后更快恢复，减少「视频卡住、音频继续」
         let isLowRes = height <= 480
         let gopFrames: Int
         if isLowRes { gopFrames = fps / 2 }           // 480p: 0.5s GOP
-        else if bitrate <= 500_000 { gopFrames = fps * 1 }  // 1s
-        else { gopFrames = fps * 2 }                 // 2s
+        else { gopFrames = fps * 1 }                  // 720p/1080p: 1s GOP（原 2s 易导致卡帧）
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         
@@ -196,13 +199,23 @@ class VideoEncoder {
             print("[\(tag)] Encoding frame: input=\(inputWidth)x\(inputHeight), encoder=\(width)x\(height)")
         }
         
+        var frameProperties: CFDictionary?
+        forceKeyFrameLock.lock()
+        if forceNextKeyFrame {
+            forceNextKeyFrame = false
+            forceKeyFrameLock.unlock()
+            frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+        } else {
+            forceKeyFrameLock.unlock()
+        }
+
         var flags: VTEncodeInfoFlags = []
         let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
             duration: duration,
-            frameProperties: nil,
+            frameProperties: frameProperties,
             sourceFrameRefcon: nil,
             infoFlagsOut: &flags
         )
@@ -259,10 +272,7 @@ class VideoEncoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: bitrateLimit)
         
         self.bitrate = newBitrate
-        let gopFrames: Int
-        if isLowRes { gopFrames = fps / 2 }
-        else if newBitrate <= 500_000 { gopFrames = fps * 1 }
-        else { gopFrames = fps * 2 }
+        let gopFrames: Int = isLowRes ? (fps / 2) : (fps * 1)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         print("[\(tag)] Bitrate updated to: \(newBitrate), GOP: \(gopFrames) frames")
     }
@@ -276,7 +286,7 @@ class VideoEncoder {
         fps = newFps
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         // Low bitrate: shorter GOP (1s) for faster recovery in weak network
-        let gopFrames = bitrate <= 500_000 ? (fps * 1) : (fps * 2)
+        let gopFrames = height <= 480 ? (fps / 2) : (fps * 1)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: gopFrames as CFNumber)
         print("[\(tag)] FPS updated to: \(fps), GOP: \(gopFrames) frames")
     }
@@ -339,13 +349,16 @@ class VideoEncoder {
     }
     
     /**
-     * Request key frame
+     * Request key frame: flush pending frames and force next encoded frame to be I-frame.
+     * 切换分辨率后拉流端需尽快收到关键帧才能恢复画面，仅 flush 不够，必须强制下一帧为 I 帧。
      */
     func requestKeyFrame() {
         guard let session = compressionSession else { return }
-        
+        forceKeyFrameLock.lock()
+        forceNextKeyFrame = true
+        forceKeyFrameLock.unlock()
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-        print("[\(tag)] Key frame requested")
+        print("[\(tag)] Key frame requested (next frame will be I-frame)")
     }
     
     /**

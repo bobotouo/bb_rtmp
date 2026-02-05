@@ -333,9 +333,9 @@ class RtmpStreamer {
     }
     
     /**
-     * 发送 SPS/PPS 到 RTMP（同步发送，必须在发送线程启动后调用）
+     * 发送 SPS/PPS 到 RTMP。高到低切换时需传当前流时间戳，与关键帧对齐，否则拉流端会卡住需刷新。
      */
-    private fun sendSpsPps() {
+    private fun sendSpsPps(timestamp: Long = 0L) {
         val sps = savedSps ?: return
         val pps = savedPps ?: return
         
@@ -344,7 +344,7 @@ class RtmpStreamer {
             return
         }
         
-        Log.d(TAG, "发送 SPS/PPS: SPS size=${sps.size}, PPS size=${pps.size}")
+        Log.d(TAG, "发送 SPS/PPS: SPS size=${sps.size}, PPS size=${pps.size}, ts=$timestamp")
         // 将 SPS/PPS 组合成 Annex-B 格式并发送（同步发送，确保在视频帧之前）
         val spsPpsData = ByteArray(sps.size + pps.size + 8)
         var idx = 0
@@ -362,8 +362,7 @@ class RtmpStreamer {
         spsPpsData[idx++] = 0x01
         System.arraycopy(pps, 0, spsPpsData, idx, pps.size)
         
-        // SPS/PPS 必须同步发送，确保在视频帧之前到达
-        val result = RtmpNative.sendVideo(rtmpHandle, spsPpsData, spsPpsData.size, 0L, true)
+        val result = RtmpNative.sendVideo(rtmpHandle, spsPpsData, spsPpsData.size, timestamp, true)
         if (result != 0) {
             Log.w(TAG, "发送 SPS/PPS 失败: $result")
         } else {
@@ -711,11 +710,11 @@ class RtmpStreamer {
     }
 
     /**
-     * 分辨率切换完成后调用：更新元数据、发送 SPS/PPS、标记仅发关键帧直至首帧
+     * 分辨率切换完成后调用：更新元数据、发送 SPS/PPS（用当前流时间戳与关键帧对齐）、标记仅发关键帧直至首帧
      */
     fun onResolutionChangeComplete(width: Int, height: Int, videoBitrate: Int, fps: Int, audioSampleRate: Int, audioChannels: Int) {
         setMetadata(width, height, videoBitrate, fps, audioSampleRate, audioChannels)
-        sendSpsPps()
+        sendSpsPps(getStreamTimestamp())
         setResolutionChangePending(true)
     }
 }

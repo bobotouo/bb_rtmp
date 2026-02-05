@@ -456,7 +456,10 @@ import Network
             }
             
             self.rtmpStreamer?.start()
-            _ = self.audioEncoder?.start()
+            // AVAudioEngine 需在主线程启动，否则 iOS 上可能无音频
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.audioEncoder?.start()
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.bitrateController?.start()
             }
@@ -1200,6 +1203,10 @@ extension BbRtmpPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
                 print("[BbRtmpPlugin] Warmup done, switching to level \(targetLevel) (\(w)x\(h))")
                 rtmpStreamer?.switchToEncoder(index: targetLevel)
                 bitrateController?.updateResolution(width: w, height: h)
+                // 切换后约 0.2s 再请求一次关键帧，拉流端多一个 I 帧锚点，减少卡帧
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+                    self?.rtmpStreamer?.getActiveVideoEncoder()?.requestKeyFrame()
+                }
             }
             return
         }

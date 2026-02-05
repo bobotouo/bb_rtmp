@@ -347,7 +347,8 @@ int rtmp_send_video(rtmp_handle_t handle, unsigned char *data, int size, long ti
     if (data == nullptr || size <= 0) return 0;
     parse_sps_pps(data, size, conn.sps, conn.pps);
     if (!conn.sent_video_config && !conn.sps.empty() && !conn.pps.empty()) {
-        if (!send_avc_sequence_header(conn, 0)) return -1;
+        /* 使用传入的 timestamp，高到低切换时与关键帧时间对齐，拉流端才能正确恢复 */
+        if (!send_avc_sequence_header(conn, (uint32_t)timestamp)) return -1;
     }
     if (!conn.sent_metadata && conn.width > 0 && conn.height > 0 && conn.sent_video_config) {
         send_on_metadata(conn);

@@ -43,15 +43,18 @@ class RtmpStreamer {
     private var heartbeatTimer: DispatchSourceTimer?
     private let heartbeatQueue = DispatchQueue(label: "com.bb_rtmp.heartbeat")
     
-    // After resolution change: drop video until new SPS/PPS is sent (so playback can decode)
+    // After resolution change: drop video until new keyframe sent (so playback can decode)
     private var resolutionChangePending = false
+    private var resolutionChangePendingStartMs: Int64 = 0  // 超时后强制恢复发帧，避免视频长时间卡住、音频继续
     private let resolutionChangeLock = NSLock()
-    
+    private let resolutionChangePendingTimeoutMs: Int64 = 150  // 最多等 150ms，超时即发帧，减少卡帧
+
     func setResolutionChangePending(_ pending: Bool) {
         resolutionChangeLock.lock()
         resolutionChangePending = pending
+        resolutionChangePendingStartMs = pending ? Int64(Date().timeIntervalSince1970 * 1000) : 0
         resolutionChangeLock.unlock()
-        if pending { print("[\(tag)] Resolution change pending, will drop video until new SPS/PPS sent") }
+        if pending { print("[\(tag)] Resolution change pending, will drop video until keyframe or \(resolutionChangePendingTimeoutMs)ms") }
     }
     
     /// 弱网/发送队列吃满时返回 true。上层应在背压时只喂当前路、不喂预热路，避免 VT 与缩放 buffer 堆积导致内存爆炸。
@@ -105,7 +108,8 @@ class RtmpStreamer {
                 _ = wrapper?.setMetadata(withWidth: Int32(w), height: Int32(h), videoBitrate: Int32(metaVideoBitrate), fps: Int32(metaFps), audioSampleRate: Int32(metaAudioSampleRate), audioChannels: Int32(metaAudioChannels))
             }
             if isStreaming {
-                _ = sendSpsPps(sps: sps, pps: pps)
+                // 高到低切换：用当前流时间戳发 AVC 头，与即将的关键帧时间对齐，拉流端才能正确恢复不卡住
+                _ = sendSpsPps(sps: sps, pps: pps, timestamp: getStreamTimestamp())
             }
             setResolutionChangePending(true)  // 只发关键帧直至首帧关键帧发出，播放端可恢复
             print("[\(tag)] Switched to encoder index=\(index) \(w)x\(h)")
@@ -194,7 +198,8 @@ class RtmpStreamer {
         return Int(max(0, elapsed))
     }
     
-    private func sendSpsPps(sps: Data, pps: Data) -> Int32 {
+    /// 发送 AVC 序列头（SPS/PPS）。高到低切换时必须用当前流时间戳，否则拉流端会认为配置在 0、下一帧在 60s 导致画面卡住需刷新。
+    private func sendSpsPps(sps: Data, pps: Data, timestamp: Int = 0) -> Int32 {
         stateLock.lock()
         let wrapper = rtmpWrapper
         stateLock.unlock()
@@ -205,7 +210,7 @@ class RtmpStreamer {
         data.append(sps)
         data.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
         data.append(pps)
-        return wrapper.sendVideo(data, timestamp: 0, isKeyFrame: true)
+        return wrapper.sendVideo(data, timestamp: timestamp, isKeyFrame: true)
     }
     
     // Video send queue for async sending (avoid blocking encoder callback thread)
@@ -235,10 +240,21 @@ class RtmpStreamer {
         if refreshing || wrapper == nil { return }
         
         resolutionChangeLock.lock()
-        let pending = resolutionChangePending
+        var pending = resolutionChangePending
+        let pendingStart = resolutionChangePendingStartMs
         resolutionChangeLock.unlock()
-        // 切换分辨率后只发关键帧，直至首帧关键帧发出，播放端才能恢复解码
-        if pending && !isKeyFrame { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if pending && !isKeyFrame {
+            if pendingStart > 0 && (nowMs - pendingStart) >= resolutionChangePendingTimeoutMs {
+                resolutionChangeLock.lock()
+                resolutionChangePending = false
+                resolutionChangePendingStartMs = 0
+                resolutionChangeLock.unlock()
+                print("[\(tag)] Resolution pending timeout, resuming video send")
+            } else {
+                return
+            }
+        }
         
         // 只把当前推流路的最后一帧留给 heartbeat
         if encoderIndex == getActiveEncoderIndex() {
@@ -301,12 +317,8 @@ class RtmpStreamer {
             let protectionTime = self.reconnectSuccessTime
             self.stateLock.unlock()
             
-            if protectionTime > 0 && (now - protectionTime) < self.reconnectProtectionPeriod {
-                // In protection period, skip sending non-key frames
-                if !isKeyFrame {
-                    return
-                }
-            }
+            // 重连保护期仅用于忽略发送错误、不触发再次重连；不再丢弃非关键帧，否则会导致「视频卡住、音频继续」
+            // （原逻辑：保护期内只发关键帧 → 8s 内几乎无视频 → 拉流卡帧）
             
             // Check queue size again (thread-safe)
             self.queueSizeLock.lock()

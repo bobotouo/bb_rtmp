@@ -79,11 +79,13 @@ class BitrateController {
         lastCheckTime = Int64(Date().timeIntervalSince1970 * 1000)
         lastBitrateChangeTime = lastCheckTime
         lastResolutionChangeTime = lastCheckTime
+        lastDowngradeTime = 0
+        downgradeConfirmCount = 0
+        upgradeConfirmCount = 0
         lastDroppedFrames = rtmpStreamer.getDroppedFrames()
         
-        // Start monitoring with a small initial delay to allow RTMP connection to stabilize
-        // This prevents immediate bitrate adjustments before connection is ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        // 稍短延迟即开始监控，推流后切换更及时（0.4s）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self = self, self.running else { return }
             // Monitor with dynamic interval based on network conditions
             self.startMonitoring()
@@ -102,9 +104,9 @@ class BitrateController {
         let sendErrorCount = rtmpStreamer.getSendErrorCount()
         let droppedFrames = stats?.droppedFrames ?? 0
         let droppedDelta = droppedFrames - lastDroppedFrames
-        // 有阻塞或错误时缩短检查间隔：4s；否则 6s（比原来 10s 更及时）
+        // 有阻塞或错误时缩短检查间隔：3s；否则 5s，推流后切换更及时
         let hasCongestion = sendErrorCount > 2 || droppedDelta > 10
-        let checkInterval: TimeInterval = hasCongestion ? 4.0 : 6.0
+        let checkInterval: TimeInterval = hasCongestion ? 3.0 : 5.0
         
         if Thread.isMainThread {
             monitorTimer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { [weak self] timer in
@@ -155,8 +157,13 @@ class BitrateController {
     private var lastBitrateChangeTime: Int64 = 0
     private var lastResolutionChangeTime: Int64 = 0
     private let minBitrateChangeInterval: Int64 = 15000   // 15s between bitrate changes
-    private let minResolutionChangeIntervalDown: Int64 = 10000 // 10s 降分辨率间隔，弱网时更快切
-    private let minResolutionChangeIntervalUp: Int64 = 18000   // 18s 升分辨率间隔，恢复时切回，避免来回抖
+    private let minResolutionChangeIntervalDown: Int64 = 15000 // 15s 降分辨率间隔，推流后切换更及时
+    private let minResolutionChangeIntervalUp: Int64 = 25000   // 25s 升分辨率间隔
+    private let minUpgradeAfterDowngradeMs: Int64 = 35000      // 降档后至少 35s 才允许升档，防止临界网络来回抖
+    private var lastDowngradeTime: Int64 = 0                    // 最近一次降档时间（用于升档防抖）
+    private var downgradeConfirmCount: Int = 0                  // 连续几次检测到需要降档才真正降（避免临界抖动）
+    private var upgradeConfirmCount: Int = 0                    // 连续几次检测到网络良好才升档（避免误升）
+    private let requiredConfirmCount = 2                       // 需连续 2 次确认才切换分辨率
     private let minBitrateChangeRatio: Float = 0.25       // At least 25% change
     
     // Blocking thresholds: 阻塞不多降码率，阻塞过多降分辨率
@@ -199,18 +206,38 @@ class BitrateController {
         )
         
         if targetLevel != currentResolutionLevel {
-            if timeSinceResChange >= minResolutionChangeIntervalDown {
-                let (w, h) = resolutionLevels[targetLevel]
-                print("[\(tag)] One-step switch: level \(currentResolutionLevel) -> \(targetLevel) (\(w)x\(h)), bitrate=\(targetBitrate)")
-                resolutionChangeCallback?(w, h)
-                updateBitrate(targetBitrate)
-                lastResolutionChangeTime = now
-                lastBitrateChangeTime = now
-                rtmpStreamer.resetDroppedFrames()
-                lastDroppedFrames = 0
-                return
+            let isDowngrade = targetLevel > currentResolutionLevel
+            let downIntervalOk = timeSinceResChange >= minResolutionChangeIntervalDown
+            // 降档：需连续 requiredConfirmCount 次确认 + 间隔满足，保证当前路是「稳不住」再切，避免临界频繁切换
+            if isDowngrade {
+                downgradeConfirmCount += 1
+                upgradeConfirmCount = 0
+                // 网络极差时 1 次确认即降档，否则需 2 次，兼顾及时与稳定
+                let severe = sendErrorCount >= 5 || droppedFrameRate >= 12.0 || delay >= 500
+                let confirmOk = severe ? (downgradeConfirmCount >= 1) : (downgradeConfirmCount >= requiredConfirmCount)
+                if downIntervalOk && confirmOk {
+                    let (w, h) = resolutionLevels[targetLevel]
+                    print("[\(tag)] One-step switch (confirmed x\(downgradeConfirmCount)): level \(currentResolutionLevel) -> \(targetLevel) (\(w)x\(h)), bitrate=\(targetBitrate)")
+                    lastDowngradeTime = now
+                    downgradeConfirmCount = 0
+                    resolutionChangeCallback?(w, h)
+                    updateBitrate(targetBitrate)
+                    lastResolutionChangeTime = now
+                    lastBitrateChangeTime = now
+                    rtmpStreamer.resetDroppedFrames()
+                    lastDroppedFrames = 0
+                    return
+                }
+                if !downIntervalOk || downgradeConfirmCount < requiredConfirmCount {
+                    return  // 未满足条件，本次不切，等下一轮
+                }
+            } else {
+                downgradeConfirmCount = 0
             }
-        } else if targetBitrate != currentBitrate {
+        } else {
+            downgradeConfirmCount = 0
+        }
+        if targetBitrate != currentBitrate {
             if timeSinceBitrateChange >= minBitrateChangeInterval {
                 let ratio = abs(Float(targetBitrate - currentBitrate)) / Float(max(1, currentBitrate))
                 if ratio >= minBitrateChangeRatio {
@@ -223,13 +250,18 @@ class BitrateController {
             return
         }
         
-        // ----- 网络良好：可升分辨率（弱网恢复）-----
-        if delay < 120 && packetLoss < 2 && sendErrorCount == 0 && droppedFrameRate < 1.5 && currentResolutionLevel > 0 {
-            if timeSinceResChange >= minResolutionChangeIntervalUp {
+        // ----- 网络良好：可升分辨率（弱网恢复），需连续确认 + 降档冷却，保证升上去后是当前网络最优路 -----
+        let timeSinceDowngrade = now - lastDowngradeTime
+        let upgradeCooldownOk = lastDowngradeTime == 0 || timeSinceDowngrade >= minUpgradeAfterDowngradeMs
+        let goodNetwork = delay < 80 && packetLoss < 1 && sendErrorCount == 0 && droppedFrameRate < 0.8
+        if goodNetwork && currentResolutionLevel > 0 {
+            upgradeConfirmCount += 1
+            if timeSinceResChange >= minResolutionChangeIntervalUp && upgradeCooldownOk && upgradeConfirmCount >= requiredConfirmCount {
                 let upLevel = currentResolutionLevel - 1
                 let (w, h) = resolutionLevels[upLevel]
                 let bitrateForUp = upLevel == 0 ? baseBitrate : (currentBitrate + 200_000)
-                print("[\(tag)] Good network -> upgrade resolution: level \(currentResolutionLevel) -> \(upLevel) (\(w)x\(h))")
+                print("[\(tag)] Good network -> upgrade (confirmed x\(upgradeConfirmCount)): level \(currentResolutionLevel) -> \(upLevel) (\(w)x\(h))")
+                upgradeConfirmCount = 0
                 resolutionChangeCallback?(w, h)
                 updateBitrate(min(bitrateForUp, baseBitrate))
                 lastResolutionChangeTime = now
@@ -238,6 +270,8 @@ class BitrateController {
                 lastDroppedFrames = 0
                 return
             }
+        } else {
+            upgradeConfirmCount = 0
         }
         // ----- 良好：缓慢升码率 -----
         if delay < 100 && packetLoss < 1 && sendErrorCount == 0 && droppedFrameRate < 1.0 && currentBitrate < baseBitrate {
@@ -249,7 +283,7 @@ class BitrateController {
         }
     }
     
-    /// 根据丢帧率、错误数、延迟等一步到位计算目标档位和码率
+    /// 根据丢帧率、错误数、延迟等一步到位计算目标档位和码率（弱网尽量一步到 480p，避免 1080→720→480 层层降）
     private func computeTargetLevelAndBitrate(dropRate: Float, sendErrorCount: Int, delay: Int, packetLoss: Int, currentLevel: Int, currentBitrate: Int) -> (level: Int, bitrate: Int) {
         // 极差：直接 480p + 最低码率
         if dropRate >= 18.0 || sendErrorCount >= 8 || delay >= 800 || packetLoss >= 15 {
@@ -261,10 +295,21 @@ class BitrateController {
             let bit = targetLevel == 2 ? minBitrate : max(minBitrate, 500_000)
             return (targetLevel, bit)
         }
-        // 较差：降一档或只降码率
+        // 较差：临界网络优先稳在当前档只调码率，只有明确顶不住再降档（减少频繁切换导致拉流卡）
         if dropRate >= dropRateLight || sendErrorCount >= 2 || delay >= 300 || packetLoss >= 5 {
+            let stepDownOne = currentLevel + 1
+            let stepDownTwo = 2
+            // 临界带：丢帧/延迟在边界时先只降码率，不切分辨率，保证当前路流畅
+            let borderline = dropRate < 10.0 && delay < 500 && sendErrorCount < 4
+            if borderline && currentLevel == 1 {
+                return (1, max(minBitrate, Int(Float(currentBitrate) * 0.65)))  // 720p 临界只降码率
+            }
+            // 当前 1080p 且阻塞/延迟较明显：直接 480p，保证流畅
+            if currentLevel == 0 && (dropRate >= 6.0 || delay >= 400 || sendErrorCount >= 3) {
+                return (stepDownTwo, minBitrate)
+            }
             if currentLevel < 2 {
-                let targetLevel = currentLevel + 1
+                let targetLevel = stepDownOne
                 let bit = targetLevel == 2 ? minBitrate : max(minBitrate, Int(Float(currentBitrate) * 0.6))
                 return (targetLevel, bit)
             }

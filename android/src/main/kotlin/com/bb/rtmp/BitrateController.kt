@@ -40,9 +40,14 @@ class BitrateController(
     private var lastCheckTime = 0L
     private var lastBitrateChangeTime = 0L
     private var lastResolutionChangeTime = 0L
+    private var lastDowngradeTime = 0L
+    private var downgradeConfirmCount = 0
+    private var upgradeConfirmCount = 0
+    private val requiredConfirmCount = 2
     private val minBitrateChangeIntervalMs = 15000L
-    private val minResolutionChangeIntervalDownMs = 10000L
-    private val minResolutionChangeIntervalUpMs = 18000L
+    private val minResolutionChangeIntervalDownMs = 22000L   // 22s 降档间隔，避免临界频繁切换导致拉流卡
+    private val minResolutionChangeIntervalUpMs = 28000L     // 28s 升档间隔
+    private val minUpgradeAfterDowngradeMs = 35000L          // 降档后至少 35s 才允许升档
     private val minBitrateChangeRatio = 0.25f
     private val dropRateLight = 3.0f
     private val bitrateCap480p = 450000  // 480p 时推流码率上限，为下行留余量
@@ -58,6 +63,9 @@ class BitrateController(
         lastCheckTime = System.currentTimeMillis()
         lastBitrateChangeTime = lastCheckTime
         lastResolutionChangeTime = lastCheckTime
+        lastDowngradeTime = 0L
+        downgradeConfirmCount = 0
+        upgradeConfirmCount = 0
         lastDroppedFrames = rtmpStreamer.getDroppedFrames()
         resolutionLevels.forEachIndexed { index, res ->
             if (res.width == width && res.height == height) {
@@ -132,18 +140,32 @@ class BitrateController(
         )
 
         if (targetLevel != currentResolutionIndex) {
-            if (timeSinceResChange >= minResolutionChangeIntervalDownMs) {
-                val res = resolutionLevels[targetLevel]
-                Log.d(TAG, "One-step switch: level $currentResolutionIndex -> $targetLevel (${res.width}x${res.height}), bitrate=$targetBitrate")
-                resolutionChangeCallback?.invoke(res.width, res.height)
-                updateBitrate(targetBitrate)
-                lastResolutionChangeTime = now
-                lastBitrateChangeTime = now
-                rtmpStreamer.resetDroppedFrames()
-                lastDroppedFrames = 0
-                return
+            val isDowngrade = targetLevel > currentResolutionIndex
+            val downIntervalOk = timeSinceResChange >= minResolutionChangeIntervalDownMs
+            if (isDowngrade) {
+                downgradeConfirmCount++
+                upgradeConfirmCount = 0
+                if (downIntervalOk && downgradeConfirmCount >= requiredConfirmCount) {
+                    val res = resolutionLevels[targetLevel]
+                    Log.d(TAG, "One-step switch (confirmed x$downgradeConfirmCount): level $currentResolutionIndex -> $targetLevel (${res.width}x${res.height}), bitrate=$targetBitrate")
+                    lastDowngradeTime = now
+                    downgradeConfirmCount = 0
+                    resolutionChangeCallback?.invoke(res.width, res.height)
+                    updateBitrate(targetBitrate)
+                    lastResolutionChangeTime = now
+                    lastBitrateChangeTime = now
+                    rtmpStreamer.resetDroppedFrames()
+                    lastDroppedFrames = 0
+                    return
+                }
+                if (!downIntervalOk || downgradeConfirmCount < requiredConfirmCount) return
+            } else {
+                downgradeConfirmCount = 0
             }
-        } else if (targetBitrate != current) {
+        } else {
+            downgradeConfirmCount = 0
+        }
+        if (targetBitrate != current) {
             if (timeSinceBitrateChange >= minBitrateChangeIntervalMs) {
                 val ratio = kotlin.math.abs(targetBitrate - current).toFloat() / maxOf(1, current)
                 if (ratio >= minBitrateChangeRatio) {
@@ -156,13 +178,18 @@ class BitrateController(
             return
         }
 
-        // 网络良好：可升分辨率
-        if (delay < 120 && packetLoss < 2 && sendErrorCount == 0 && droppedFrameRate < 1.5f && currentResolutionIndex > 0) {
-            if (timeSinceResChange >= minResolutionChangeIntervalUpMs) {
+        // 网络良好：可升分辨率，需连续确认 + 降档冷却
+        val timeSinceDowngrade = now - lastDowngradeTime
+        val upgradeCooldownOk = lastDowngradeTime == 0L || timeSinceDowngrade >= minUpgradeAfterDowngradeMs
+        val goodNetwork = delay < 80 && packetLoss < 1 && sendErrorCount == 0 && droppedFrameRate < 0.8f
+        if (goodNetwork && currentResolutionIndex > 0) {
+            upgradeConfirmCount++
+            if (timeSinceResChange >= minResolutionChangeIntervalUpMs && upgradeCooldownOk && upgradeConfirmCount >= requiredConfirmCount) {
                 val upLevel = currentResolutionIndex - 1
                 val res = resolutionLevels[upLevel]
                 val bitrateForUp = if (upLevel == 0) baseBitrate else (current + 200000)
-                Log.d(TAG, "Good network -> upgrade: level $currentResolutionIndex -> $upLevel (${res.width}x${res.height})")
+                Log.d(TAG, "Good network -> upgrade (confirmed x$upgradeConfirmCount): level $currentResolutionIndex -> $upLevel (${res.width}x${res.height})")
+                upgradeConfirmCount = 0
                 resolutionChangeCallback?.invoke(res.width, res.height)
                 updateBitrate(minOf(bitrateForUp, baseBitrate))
                 lastResolutionChangeTime = now
@@ -171,6 +198,8 @@ class BitrateController(
                 lastDroppedFrames = 0
                 return
             }
+        } else {
+            upgradeConfirmCount = 0
         }
         // 良好：缓慢升码率
         if (delay < 100 && packetLoss < 1 && sendErrorCount == 0 && droppedFrameRate < 1.0f && current < baseBitrate) {
@@ -199,6 +228,13 @@ class BitrateController(
             return Pair(targetLevel, bit)
         }
         if (dropRate >= dropRateLight || sendErrorCount >= 2 || delay >= 300 || packetLoss >= 5) {
+            val borderline = dropRate < 10f && delay < 500 && sendErrorCount < 4
+            if (borderline && currentLevel == 1) {
+                return Pair(1, maxOf(minBitrate, (currentBitrate * 0.65f).toInt()))
+            }
+            if (currentLevel == 0 && (dropRate >= 6f || delay >= 400 || sendErrorCount >= 3)) {
+                return Pair(2, minBitrate)
+            }
             if (currentLevel < 2) {
                 val targetLevel = currentLevel + 1
                 val bit = if (targetLevel == 2) minBitrate else maxOf(minBitrate, (currentBitrate * 0.6f).toInt())

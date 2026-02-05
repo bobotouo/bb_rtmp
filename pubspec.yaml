@@ -2,6 +2,7 @@ name: bb_rtmp
 description: 高性能 Flutter RTMP 推流插件，支持硬件编码、零拷贝、自适应码率
 version: 0.1.0
 homepage: https://github.com/yourusername/bb_rtmp
+license: MIT
 
 environment:
   sdk: ">=2.17.0 <4.0.0"

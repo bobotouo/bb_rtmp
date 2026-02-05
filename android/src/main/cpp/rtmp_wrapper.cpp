@@ -587,7 +587,8 @@ int rtmp_send_video(rtmp_handle_t handle, unsigned char *data, int size, long ti
     // 发送 AVC sequence header（包含 SPS/PPS）
     if (!conn.sent_video_config && !conn.sps.empty() && !conn.pps.empty()) {
         LOGD("发送 AVC sequence header");
-        bool config_ok = send_avc_sequence_header(conn, 0);
+        /* 高到低切换时使用传入的 timestamp，与关键帧时间对齐，拉流端才能正确恢复 */
+        bool config_ok = send_avc_sequence_header(conn, (uint32_t) timestamp);
         if (config_ok) {
             LOGD("AVC sequence header 发送成功");
         } else {
